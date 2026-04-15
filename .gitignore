@@ -1,0 +1,27 @@
+# Runtime artifacts
+/var/
+/bin/
+/dist/
+
+# TLS material (regenerated locally)
+*.pem
+*.key
+*.crt
+*.csr
+
+# Live working plan — not a tracked artifact
+/plan.md
+
+# Go build output
+/server
+/client
+/proxy
+/fleet
+
+# Editor/OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
