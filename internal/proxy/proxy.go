@@ -26,6 +26,7 @@ type Options struct {
 	UpstreamAddr *net.UDPAddr
 	Logger       *slog.Logger
 	IdleTimeout  time.Duration
+	DialUDP      func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
 }
 
 type Proxy struct {
@@ -33,6 +34,7 @@ type Proxy struct {
 	upstreamAddr *net.UDPAddr
 	logger       *slog.Logger
 	idleTimeout  time.Duration
+	dialUDP      func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
 
 	sessionsMu sync.Mutex
 	sessions   map[netip.AddrPort]*session
@@ -89,6 +91,7 @@ func New(opts Options) (*Proxy, error) {
 		upstreamAddr: opts.UpstreamAddr,
 		logger:       log,
 		idleTimeout:  idleTimeout,
+		dialUDP:      pickDialUDP(opts.DialUDP),
 		sessions:     make(map[netip.AddrPort]*session),
 		closed:       make(chan struct{}),
 	}, nil
@@ -123,7 +126,12 @@ func (p *Proxy) Serve(ctx context.Context) error {
 
 		sess, err := p.getOrCreateSession(key, clientAddr)
 		if err != nil {
-			return err
+			p.logger.Warn("drop client packet: failed to create proxy session",
+				"client", key.String(),
+				"upstream", p.upstreamAddr.String(),
+				"error", err,
+			)
+			continue
 		}
 		if err := sess.enqueueIncoming(copyPacket(buf[:n])); err != nil {
 			if p.isClosed() {
@@ -167,7 +175,7 @@ func (p *Proxy) getOrCreateSession(key netip.AddrPort, clientAddr *net.UDPAddr) 
 	}
 	p.sessionsMu.Unlock()
 
-	upstreamConn, err := net.DialUDP("udp", nil, p.upstreamAddr)
+	upstreamConn, err := p.dialUDP("udp", nil, p.upstreamAddr)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: dial upstream for %s: %w", key, err)
 	}
@@ -367,6 +375,9 @@ func udpAddrToAddrPort(addr *net.UDPAddr) (netip.AddrPort, error) {
 	if !ok {
 		return netip.AddrPort{}, fmt.Errorf("invalid IP %v", addr.IP)
 	}
+	if addr.Zone != "" {
+		ip = ip.WithZone(addr.Zone)
+	}
 	return netip.AddrPortFrom(ip.Unmap(), uint16(addr.Port)), nil
 }
 
@@ -387,4 +398,11 @@ func copyPacket(src []byte) []byte {
 	dst := make([]byte, len(src))
 	copy(dst, src)
 	return dst
+}
+
+func pickDialUDP(fn func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)) func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
+	if fn != nil {
+		return fn
+	}
+	return net.DialUDP
 }
