@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,7 +16,9 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/webtransport-go"
 
+	"quixiot/internal/broker"
 	"quixiot/internal/logging"
 	"quixiot/internal/upload"
 )
@@ -28,6 +31,7 @@ const (
 	defaultMaxStreamReceiveWindow     = 6 * 1024 * 1024
 	defaultInitialConnReceiveWindow   = 1024 * 1024
 	defaultMaxConnReceiveWindow       = 15 * 1024 * 1024
+	pubsubProtocol                    = "quixiot-pubsub-v1"
 )
 
 type Options struct {
@@ -44,6 +48,8 @@ type Server struct {
 	transport  *quic.Transport
 	listener   *quic.EarlyListener
 	http3      *http3.Server
+	wt         *webtransport.Server
+	broker     *broker.Broker
 	logger     *slog.Logger
 	version    string
 	startedAt  time.Time
@@ -95,6 +101,7 @@ func New(opts Options) (*Server, error) {
 		logger:     log,
 		version:    version,
 		startedAt:  startedAt,
+		broker:     broker.New(log),
 	}
 
 	mux := http.NewServeMux()
@@ -104,6 +111,7 @@ func New(opts Options) (*Server, error) {
 		Dir:    uploadDir,
 		Logger: log,
 	})
+	mux.HandleFunc("CONNECT /pubsub", s.handlePubSub)
 
 	s.transport = &quic.Transport{Conn: opts.PacketConn}
 	listener, err := s.transport.ListenEarly(http3.ConfigureTLSConfig(opts.TLSConfig), quicConfig())
@@ -118,6 +126,11 @@ func New(opts Options) (*Server, error) {
 		EnableDatagrams: true,
 		Logger:          log,
 	}
+	webtransport.ConfigureHTTP3Server(s.http3)
+	s.wt = &webtransport.Server{
+		H3:                   s.http3,
+		ApplicationProtocols: []string{pubsubProtocol},
+	}
 	return s, nil
 }
 
@@ -126,26 +139,33 @@ func (s *Server) Addr() net.Addr {
 }
 
 func (s *Server) Serve(ctx context.Context) error {
-	errCh := make(chan error, 1)
 	go func() {
-		errCh <- s.http3.ServeListener(s.listener)
+		<-ctx.Done()
+		_ = s.Close()
 	}()
 
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		_ = s.Close()
-		<-errCh
-		return nil
+	for {
+		conn, err := s.listener.Accept(ctx)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("server: accept quic conn: %w", err)
+		}
+
+		go func(conn *quic.Conn) {
+			if err := s.wt.ServeQUICConn(conn); err != nil && !errors.Is(err, net.ErrClosed) && ctx.Err() == nil {
+				s.logger.Warn("serve webtransport conn failed", "remote", conn.RemoteAddr().String(), "error", err)
+			}
+		}(conn)
 	}
 }
 
 func (s *Server) Close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {
-		if s.http3 != nil {
-			if err := s.http3.Close(); err != nil && closeErr == nil {
+		if s.wt != nil {
+			if err := s.wt.Close(); err != nil && closeErr == nil {
 				closeErr = err
 			}
 		}
@@ -165,12 +185,13 @@ func (s *Server) Close() error {
 
 func quicConfig() *quic.Config {
 	return &quic.Config{
-		MaxIdleTimeout:                 defaultMaxIdleTimeout,
-		InitialStreamReceiveWindow:     defaultInitialStreamReceiveWindow,
-		MaxStreamReceiveWindow:         defaultMaxStreamReceiveWindow,
-		InitialConnectionReceiveWindow: defaultInitialConnReceiveWindow,
-		MaxConnectionReceiveWindow:     defaultMaxConnReceiveWindow,
-		EnableDatagrams:                true,
+		MaxIdleTimeout:                   defaultMaxIdleTimeout,
+		InitialStreamReceiveWindow:       defaultInitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:           defaultMaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow:   defaultInitialConnReceiveWindow,
+		MaxConnectionReceiveWindow:       defaultMaxConnReceiveWindow,
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true,
 	}
 }
 
@@ -203,6 +224,11 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reqLog.Info("served config")
+}
+
+func (s *Server) handlePubSub(w http.ResponseWriter, r *http.Request) {
+	s.requestLogger(r).Info("upgrading pubsub session")
+	s.broker.HandleRequest(w, r, s.wt)
 }
 
 func (s *Server) requestLogger(r *http.Request) *slog.Logger {

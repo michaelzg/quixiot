@@ -105,4 +105,55 @@ func TestServerEndpointsOverHTTP3(t *testing.T) {
 	if result.Bytes != 4096 {
 		t.Fatalf("upload bytes: want 4096 got %d", result.Bytes)
 	}
+
+	sub, err := c.ConnectPubSub(context.Background(), "device-123-sub")
+	if err != nil {
+		t.Fatalf("ConnectPubSub subscriber: %v", err)
+	}
+	defer sub.Close()
+	pub, err := c.ConnectPubSub(context.Background(), "device-123-pub")
+	if err != nil {
+		t.Fatalf("ConnectPubSub publisher: %v", err)
+	}
+	defer pub.Close()
+
+	if err := sub.Subscribe(context.Background(), cfg.TelemetryTopic); err != nil {
+		t.Fatalf("Subscribe telemetry: %v", err)
+	}
+	if err := sub.Subscribe(context.Background(), cfg.CommandTopic); err != nil {
+		t.Fatalf("Subscribe command: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := pub.PublishDatagram(cfg.TelemetryTopic, []byte("temp=21")); err != nil {
+		t.Fatalf("PublishDatagram: %v", err)
+	}
+	if err := pub.PublishStream(context.Background(), cfg.CommandTopic, []byte("reboot")); err != nil {
+		t.Fatalf("PublishStream: %v", err)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case msg, ok := <-sub.Messages():
+			if !ok {
+				t.Fatal("subscriber messages closed early")
+			}
+			switch msg.Topic {
+			case cfg.TelemetryTopic:
+				if string(msg.Payload) == "temp=21" {
+					seen[msg.Topic] = true
+				}
+			case cfg.CommandTopic:
+				if string(msg.Payload) == "reboot" {
+					seen[msg.Topic] = true
+				}
+			}
+		default:
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for pubsub messages; seen=%v", seen)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
 }

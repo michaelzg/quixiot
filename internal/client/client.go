@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -39,6 +40,7 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	transport  *http3.Transport
+	tlsConfig  *tls.Config
 	logger     *slog.Logger
 }
 
@@ -94,6 +96,7 @@ func New(opts Options) (*Client, error) {
 		baseURL:    baseURL,
 		httpClient: &http.Client{Transport: transport},
 		transport:  transport,
+		tlsConfig:  tlsConf,
 		logger:     log,
 	}, nil
 }
@@ -174,14 +177,15 @@ func (c *Client) Close() error {
 
 func quicConfig() *quic.Config {
 	return &quic.Config{
-		MaxIdleTimeout:                 defaultMaxIdleTimeout,
-		KeepAlivePeriod:                defaultKeepAlivePeriod,
-		InitialStreamReceiveWindow:     defaultInitialStreamReceiveWindow,
-		MaxStreamReceiveWindow:         defaultMaxStreamReceiveWindow,
-		InitialConnectionReceiveWindow: defaultInitialConnReceiveWindow,
-		MaxConnectionReceiveWindow:     defaultMaxConnReceiveWindow,
-		EnableDatagrams:                true,
-		DisablePathMTUDiscovery:        true,
+		MaxIdleTimeout:                   defaultMaxIdleTimeout,
+		KeepAlivePeriod:                  defaultKeepAlivePeriod,
+		InitialStreamReceiveWindow:       defaultInitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:           defaultMaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow:   defaultInitialConnReceiveWindow,
+		MaxConnectionReceiveWindow:       defaultMaxConnReceiveWindow,
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true,
+		DisablePathMTUDiscovery:          true,
 	}
 }
 
