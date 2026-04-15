@@ -7,10 +7,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"quixiot/internal/config"
+	"quixiot/internal/impair"
 	"quixiot/internal/logging"
 	"quixiot/internal/proxy"
 )
@@ -45,7 +48,7 @@ func run(args []string) error {
 	cfgPath := fs.String("config", "", "YAML config file (optional)")
 	listen := fs.String("listen", def.Listen, "client-facing UDP listen address")
 	upstream := fs.String("upstream", def.Upstream, "upstream UDP address")
-	profile := fs.String("profile", def.Profile, "network profile (Phase 5 supports only passthrough)")
+	profile := fs.String("profile", def.Profile, "network profile: passthrough|wifi-good|cellular-lte|cellular-3g|satellite|flaky or a profile YAML path")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
 
 	if err := fs.Parse(args); err != nil {
@@ -69,8 +72,9 @@ func run(args []string) error {
 		}
 	})
 
-	if cfg.Profile != "passthrough" {
-		return fmt.Errorf("proxy: unsupported profile %q (Phase 5 supports only passthrough)", cfg.Profile)
+	profileConfig, profileSource, err := loadProfile(cfg.Profile)
+	if err != nil {
+		return err
 	}
 
 	log, err := logging.New(logging.Options{Level: cfg.LogLevel})
@@ -98,6 +102,7 @@ func run(args []string) error {
 		ListenConn:   listenConn,
 		UpstreamAddr: upstreamAddr,
 		Logger:       log,
+		Profile:      profileConfig,
 	})
 	if err != nil {
 		_ = listenConn.Close()
@@ -111,8 +116,53 @@ func run(args []string) error {
 	log.Info("proxy listening",
 		"listen", listenConn.LocalAddr().String(),
 		"upstream", upstreamAddr.String(),
-		"profile", cfg.Profile,
+		"profile", profileConfig.Name,
+		"profile_source", profileSource,
+		"profile_seed", profileConfig.Seed,
 		"idle_timeout", (5 * time.Minute).String(),
 	)
 	return p.Serve(ctx)
+}
+
+func loadProfile(raw string) (impair.Profile, string, error) {
+	switch raw {
+	case "", "passthrough":
+		return impair.PassthroughProfile(), "builtin:passthrough", nil
+	}
+
+	path := resolveProfilePath(raw)
+	var profile impair.Profile
+	if err := config.LoadFile(path, &profile); err != nil {
+		return impair.Profile{}, "", fmt.Errorf("proxy: load profile %q: %w", raw, err)
+	}
+	normalized, err := impair.NormalizeProfile(profile)
+	if err != nil {
+		return impair.Profile{}, "", fmt.Errorf("proxy: validate profile %q: %w", raw, err)
+	}
+	if normalized.Name == "custom" {
+		normalized.Name = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	}
+	return normalized, path, nil
+}
+
+func resolveProfilePath(raw string) string {
+	if strings.ContainsRune(raw, filepath.Separator) || strings.HasSuffix(raw, ".yaml") || strings.HasSuffix(raw, ".yml") {
+		return raw
+	}
+	filename := "proxy-" + raw + ".yaml"
+	if cwd, err := os.Getwd(); err == nil {
+		dir := cwd
+		for {
+			candidate := filepath.Join(dir, "configs", filename)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return filepath.Join("configs", filename)
 }

@@ -1,0 +1,18 @@
+name: wifi-good
+seed: 1001
+to_server:
+  drop_probability: 0.002
+  duplicate_probability: 0.0
+  reorder_probability: 0.001
+  reorder_hold: 2ms
+  latency: 8ms
+  jitter: 3ms
+  bandwidth_bytes_per_sec: 10000000
+to_client:
+  drop_probability: 0.002
+  duplicate_probability: 0.0
+  reorder_probability: 0.001
+  reorder_hold: 2ms
+  latency: 8ms
+  jitter: 3ms
+  bandwidth_bytes_per_sec: 10000000

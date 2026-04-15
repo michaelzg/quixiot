@@ -5,16 +5,39 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"quixiot/internal/client"
+	"quixiot/internal/config"
+	"quixiot/internal/impair"
 	"quixiot/internal/proxy"
 	"quixiot/internal/server"
 	"quixiot/internal/tlsutil"
 )
 
 func TestProxyForwardsHTTP3AndUpload(t *testing.T) {
+	testProxyForwardsHTTP3AndUpload(t, impair.PassthroughProfile(), 3*time.Second, 4096)
+}
+
+func TestProxyForwardsHTTP3AndUploadThroughFlakyProfile(t *testing.T) {
+	var profile impair.Profile
+	path := filepath.Join("..", "..", "configs", "proxy-flaky.yaml")
+	if err := config.LoadFile(path, &profile); err != nil {
+		t.Fatalf("LoadFile(%s): %v", path, err)
+	}
+	normalized, err := impair.NormalizeProfile(profile)
+	if err != nil {
+		t.Fatalf("NormalizeProfile: %v", err)
+	}
+
+	testProxyForwardsHTTP3AndUpload(t, normalized, 15*time.Second, 2048)
+}
+
+func testProxyForwardsHTTP3AndUpload(t *testing.T, profile impair.Profile, deadline time.Duration, uploadSize int64) {
+	t.Helper()
+
 	dir := t.TempDir()
 	paths, err := tlsutil.GenerateLocal(dir, []string{"127.0.0.1", "localhost", "::1"}, 24*time.Hour)
 	if err != nil {
@@ -74,6 +97,7 @@ func TestProxyForwardsHTTP3AndUpload(t *testing.T) {
 		UpstreamAddr: backendUDP,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		IdleTimeout:  time.Minute,
+		Profile:      profile,
 	})
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
@@ -103,13 +127,13 @@ func TestProxyForwardsHTTP3AndUpload(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	var state client.State
-	deadline := time.Now().Add(3 * time.Second)
+	readyBy := time.Now().Add(deadline)
 	for {
 		state, err = c.GetState(context.Background())
 		if err == nil {
 			break
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(readyBy) {
 			t.Fatalf("GetState through proxy: %v", err)
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -126,11 +150,14 @@ func TestProxyForwardsHTTP3AndUpload(t *testing.T) {
 		t.Fatalf("config client_id: want device-123 got %q", cfg.ClientID)
 	}
 
-	result, err := c.UploadDeterministic(context.Background(), "proxy-upload.bin", 4096, 11)
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+
+	result, err := c.UploadDeterministic(ctx, "proxy-upload.bin", uploadSize, 11)
 	if err != nil {
 		t.Fatalf("UploadDeterministic through proxy: %v", err)
 	}
-	if result.Bytes != 4096 {
-		t.Fatalf("upload bytes: want 4096 got %d", result.Bytes)
+	if result.Bytes != uploadSize {
+		t.Fatalf("upload bytes: want %d got %d", uploadSize, result.Bytes)
 	}
 }

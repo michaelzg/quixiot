@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"quixiot/internal/impair"
 )
 
 const (
@@ -27,6 +30,7 @@ type Options struct {
 	Logger       *slog.Logger
 	IdleTimeout  time.Duration
 	DialUDP      func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+	Profile      impair.Profile
 }
 
 type Proxy struct {
@@ -35,6 +39,7 @@ type Proxy struct {
 	logger       *slog.Logger
 	idleTimeout  time.Duration
 	dialUDP      func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+	profile      impair.Profile
 
 	sessionsMu sync.Mutex
 	sessions   map[netip.AddrPort]*session
@@ -60,6 +65,9 @@ type session struct {
 	toServer chan packet
 	toClient chan packet
 
+	toServerPipeline *impair.Pipeline
+	toClientPipeline *impair.Pipeline
+
 	lastSeen  atomic.Int64
 	closeOnce sync.Once
 	done      chan struct{}
@@ -81,6 +89,10 @@ func New(opts Options) (*Proxy, error) {
 	if idleTimeout <= 0 {
 		idleTimeout = defaultIdleTTL
 	}
+	profile, err := impair.NormalizeProfile(opts.Profile)
+	if err != nil {
+		return nil, err
+	}
 
 	if err := opts.ListenConn.SetReadBuffer(ReadBufferSize); err != nil {
 		return nil, fmt.Errorf("proxy: set listen read buffer: %w", err)
@@ -92,6 +104,7 @@ func New(opts Options) (*Proxy, error) {
 		logger:       log,
 		idleTimeout:  idleTimeout,
 		dialUDP:      pickDialUDP(opts.DialUDP),
+		profile:      profile,
 		sessions:     make(map[netip.AddrPort]*session),
 		closed:       make(chan struct{}),
 	}, nil
@@ -183,19 +196,31 @@ func (p *Proxy) getOrCreateSession(key netip.AddrPort, clientAddr *net.UDPAddr) 
 		_ = upstreamConn.Close()
 		return nil, fmt.Errorf("proxy: set upstream read buffer: %w", err)
 	}
+	toServerPipeline, err := impair.NewPipeline(p.profile.ToServer, sessionSeed(p.profile.Seed, key, "to-server"))
+	if err != nil {
+		_ = upstreamConn.Close()
+		return nil, err
+	}
+	toClientPipeline, err := impair.NewPipeline(p.profile.ToClient, sessionSeed(p.profile.Seed, key, "to-client"))
+	if err != nil {
+		_ = upstreamConn.Close()
+		return nil, err
+	}
 
 	sess := &session{
-		owner:        p,
-		key:          key,
-		clientAddr:   cloneUDPAddr(clientAddr),
-		listenConn:   p.listenConn,
-		upstreamAddr: p.upstreamAddr,
-		upstreamConn: upstreamConn,
-		logger:       p.logger.With("client", key.String(), "upstream", p.upstreamAddr.String()),
-		incoming:     make(chan packet, queueDepth),
-		toServer:     make(chan packet, queueDepth),
-		toClient:     make(chan packet, queueDepth),
-		done:         make(chan struct{}),
+		owner:            p,
+		key:              key,
+		clientAddr:       cloneUDPAddr(clientAddr),
+		listenConn:       p.listenConn,
+		upstreamAddr:     p.upstreamAddr,
+		upstreamConn:     upstreamConn,
+		logger:           p.logger.With("client", key.String(), "upstream", p.upstreamAddr.String()),
+		incoming:         make(chan packet, queueDepth),
+		toServer:         make(chan packet, queueDepth),
+		toClient:         make(chan packet, queueDepth),
+		toServerPipeline: toServerPipeline,
+		toClientPipeline: toClientPipeline,
+		done:             make(chan struct{}),
 	}
 	sess.touch()
 
@@ -273,21 +298,10 @@ func (s *session) acceptLoop() {
 }
 
 func (s *session) toServerLoop() {
-	for {
-		select {
-		case <-s.done:
-			return
-		case pkt := <-s.toServer:
-			if _, err := s.upstreamConn.Write(pkt.data); err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					s.logger.Warn("write to upstream failed", "error", err)
-				}
-				_ = s.owner.removeSession(s.key, s)
-				return
-			}
-			s.touch()
-		}
-	}
+	s.applyLoop(s.toServer, s.toServerPipeline, func(data []byte) error {
+		_, err := s.upstreamConn.Write(data)
+		return err
+	}, "write to upstream failed")
 }
 
 func (s *session) returnReadLoop() {
@@ -312,21 +326,78 @@ func (s *session) returnReadLoop() {
 }
 
 func (s *session) toClientLoop() {
-	for {
+	s.applyLoop(s.toClient, s.toClientPipeline, func(data []byte) error {
+		_, err := s.listenConn.WriteToUDP(data, s.clientAddr)
+		return err
+	}, "write to client failed")
+}
+
+func (s *session) applyLoop(input <-chan packet, pipeline *impair.Pipeline, write func([]byte) error, logMessage string) {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
 		select {
-		case <-s.done:
-			return
-		case pkt := <-s.toClient:
-			if _, err := s.listenConn.WriteToUDP(pkt.data, s.clientAddr); err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					s.logger.Warn("write to client failed", "error", err)
-				}
-				_ = s.owner.removeSession(s.key, s)
-				return
-			}
-			s.touch()
+		case <-timer.C:
+		default:
 		}
 	}
+	defer timer.Stop()
+
+	timerCh := (<-chan time.Time)(nil)
+	for {
+		if !s.flushReady(pipeline, write, logMessage) {
+			return
+		}
+		timerCh = resetTimer(timer, timerCh, pipeline)
+
+		select {
+		case <-s.done:
+			pipeline.Flush(time.Now())
+			_ = s.flushReady(pipeline, write, logMessage)
+			return
+		case pkt := <-input:
+			pipeline.Enqueue(time.Now(), pkt.data)
+		case <-timerCh:
+		}
+	}
+}
+
+func (s *session) flushReady(pipeline *impair.Pipeline, write func([]byte) error, logMessage string) bool {
+	for _, data := range pipeline.ReleaseReady(time.Now()) {
+		if err := write(data); err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				s.logger.Warn(logMessage, "error", err)
+			}
+			_ = s.owner.removeSession(s.key, s)
+			return false
+		}
+		s.touch()
+	}
+	return true
+}
+
+func resetTimer(timer *time.Timer, current <-chan time.Time, pipeline *impair.Pipeline) <-chan time.Time {
+	next, ok := pipeline.NextWake()
+	if !ok {
+		if current != nil && !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return nil
+	}
+	if current != nil && !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	delay := time.Until(next)
+	if delay < 0 {
+		delay = 0
+	}
+	timer.Reset(delay)
+	return timer.C
 }
 
 func (s *session) enqueueIncoming(pkt []byte) error {
@@ -405,4 +476,12 @@ func pickDialUDP(fn func(network string, laddr, raddr *net.UDPAddr) (*net.UDPCon
 		return fn
 	}
 	return net.DialUDP
+}
+
+func sessionSeed(base int64, key netip.AddrPort, direction string) int64 {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(key.String()))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(direction))
+	return int64(hasher.Sum64() ^ uint64(base))
 }

@@ -1,0 +1,18 @@
+name: cellular-3g
+seed: 3003
+to_server:
+  drop_probability: 0.03
+  duplicate_probability: 0.002
+  reorder_probability: 0.02
+  reorder_hold: 8ms
+  latency: 90ms
+  jitter: 40ms
+  bandwidth_bytes_per_sec: 550000
+to_client:
+  drop_probability: 0.03
+  duplicate_probability: 0.002
+  reorder_probability: 0.02
+  reorder_hold: 8ms
+  latency: 90ms
+  jitter: 40ms
+  bandwidth_bytes_per_sec: 550000
