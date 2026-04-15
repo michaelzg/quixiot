@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -58,6 +59,13 @@ func PathsIn(outDir string) Paths {
 // SANs. validFor controls the server leaf validity; the CA validity is 10× that,
 // capped at 10 years.
 func GenerateLocal(outDir string, sans []string, validFor time.Duration) (Paths, error) {
+	if validFor <= 0 {
+		return Paths{}, fmt.Errorf("tlsutil: validity must be positive: %s", validFor)
+	}
+	sans, err := normalizeSANs(sans)
+	if err != nil {
+		return Paths{}, err
+	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return Paths{}, fmt.Errorf("tlsutil: mkdir %s: %w", outDir, err)
 	}
@@ -190,15 +198,7 @@ func randomSerial() (*big.Int, error) {
 }
 
 func writeCertPEM(path string, der []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return fmt.Errorf("tlsutil: open %s: %w", path, err)
-	}
-	defer f.Close()
-	if err := pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-		return fmt.Errorf("tlsutil: write %s: %w", path, err)
-	}
-	return nil
+	return writePEM(path, &pem.Block{Type: "CERTIFICATE", Bytes: der}, mode)
 }
 
 func writeECKeyPEM(path string, key *ecdsa.PrivateKey, mode os.FileMode) error {
@@ -206,13 +206,54 @@ func writeECKeyPEM(path string, key *ecdsa.PrivateKey, mode os.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("tlsutil: marshal ec key: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return fmt.Errorf("tlsutil: open %s: %w", path, err)
+	return writePEM(path, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}, mode)
+}
+
+func normalizeSANs(sans []string) ([]string, error) {
+	out := make([]string, 0, len(sans))
+	for _, san := range sans {
+		san = strings.TrimSpace(san)
+		if san == "" {
+			continue
+		}
+		out = append(out, san)
 	}
-	defer f.Close()
-	if err := pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}); err != nil {
+	if len(out) == 0 {
+		return nil, fmt.Errorf("tlsutil: at least one SAN is required")
+	}
+	return out, nil
+}
+
+func writePEM(path string, block *pem.Block, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("tlsutil: create temp for %s: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	keepTemp := false
+	defer func() {
+		if !keepTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("tlsutil: chmod temp %s: %w", tmpPath, err)
+	}
+	if err := pem.Encode(tmp, block); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("tlsutil: write %s: %w", path, err)
 	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("tlsutil: close temp %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("tlsutil: replace %s: %w", path, err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		return fmt.Errorf("tlsutil: chmod %s: %w", path, err)
+	}
+	keepTemp = true
 	return nil
 }

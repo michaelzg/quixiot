@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -131,4 +132,49 @@ func TestClientTrustRejectsUnknownLeaf(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected handshake failure against unknown CA")
 	}
+}
+
+func TestGenerateLocalRejectsInvalidInputs(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, err := tlsutil.GenerateLocal(dir, nil, 24*time.Hour); err == nil {
+		t.Fatal("expected error for missing SANs")
+	}
+	if _, err := tlsutil.GenerateLocal(dir, []string{"localhost"}, 0); err == nil {
+		t.Fatal("expected error for non-positive validity")
+	}
+}
+
+func TestGenerateLocalRestoresKeyPermissions(t *testing.T) {
+	dir := t.TempDir()
+	paths, err := tlsutil.GenerateLocal(dir, []string{"localhost"}, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateLocal: %v", err)
+	}
+
+	if err := os.Chmod(paths.ServerKey, 0o644); err != nil {
+		t.Fatalf("chmod server key: %v", err)
+	}
+	if err := os.Chmod(paths.CAKey, 0o644); err != nil {
+		t.Fatalf("chmod ca key: %v", err)
+	}
+
+	paths, err = tlsutil.GenerateLocal(dir, []string{"localhost"}, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateLocal second run: %v", err)
+	}
+
+	assertMode := func(path string, want os.FileMode) {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Fatalf("%s mode: want %03o got %03o", path, want, got)
+		}
+	}
+
+	assertMode(paths.ServerKey, 0o600)
+	assertMode(paths.CAKey, 0o600)
 }

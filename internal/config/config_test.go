@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"quixiot/internal/config"
@@ -43,5 +44,26 @@ func TestLoadFileMissing(t *testing.T) {
 	var got struct{ X string }
 	if err := config.LoadFile(filepath.Join(t.TempDir(), "nope.yaml"), &got); err == nil {
 		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestLoadFileUnknownField(t *testing.T) {
+	type sample struct {
+		Addr string `yaml:"addr"`
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.yaml")
+	if err := os.WriteFile(path, []byte("addr: :4444\nlog_levl: debug\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var got sample
+	err := config.LoadFile(path, &got)
+	if err == nil {
+		t.Fatal("expected error for unknown field")
+	}
+	if !strings.Contains(err.Error(), "field log_levl not found") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
