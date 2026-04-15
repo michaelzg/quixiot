@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -73,5 +74,18 @@ func TestProxyContinuesAfterSessionCreationFailure(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Serve did not exit after cancel")
+	}
+}
+
+func TestSessionEnqueueIncomingReturnsQueueFullWhenFull(t *testing.T) {
+	sess := &session{
+		incoming: make(chan packet, 1),
+		done:     make(chan struct{}),
+	}
+	sess.incoming <- packet{data: []byte("first")}
+
+	err := sess.enqueueIncoming([]byte("second"))
+	if !errors.Is(err, errSessionQueueFull) {
+		t.Fatalf("enqueueIncoming: want %v got %v", errSessionQueueFull, err)
 	}
 }

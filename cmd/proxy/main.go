@@ -125,9 +125,11 @@ func run(args []string) error {
 }
 
 func loadProfile(raw string) (impair.Profile, string, error) {
-	switch raw {
-	case "", "passthrough":
-		return impair.PassthroughProfile(), "builtin:passthrough", nil
+	if raw == "" {
+		raw = "passthrough"
+	}
+	if profile, ok := impair.BuiltinProfile(raw); ok {
+		return profile, "builtin:" + raw, nil
 	}
 
 	path := resolveProfilePath(raw)
@@ -149,20 +151,5 @@ func resolveProfilePath(raw string) string {
 	if strings.ContainsRune(raw, filepath.Separator) || strings.HasSuffix(raw, ".yaml") || strings.HasSuffix(raw, ".yml") {
 		return raw
 	}
-	filename := "proxy-" + raw + ".yaml"
-	if cwd, err := os.Getwd(); err == nil {
-		dir := cwd
-		for {
-			candidate := filepath.Join(dir, "configs", filename)
-			if _, err := os.Stat(candidate); err == nil {
-				return candidate
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-	return filepath.Join("configs", filename)
+	return filepath.Join("configs", "proxy-"+raw+".yaml")
 }

@@ -24,6 +24,8 @@ const (
 	queueDepth     = 256
 )
 
+var errSessionQueueFull = errors.New("proxy: session ingress queue full")
+
 type Options struct {
 	ListenConn   *net.UDPConn
 	UpstreamAddr *net.UDPAddr
@@ -149,6 +151,10 @@ func (p *Proxy) Serve(ctx context.Context) error {
 		if err := sess.enqueueIncoming(copyPacket(buf[:n])); err != nil {
 			if p.isClosed() {
 				return nil
+			}
+			if errors.Is(err, errSessionQueueFull) {
+				p.logger.Warn("drop client packet for overloaded session", "client", key.String(), "error", err)
+				continue
 			}
 			p.logger.Warn("drop client packet for closed session", "client", key.String(), "error", err)
 		}
@@ -406,6 +412,8 @@ func (s *session) enqueueIncoming(pkt []byte) error {
 		return os.ErrClosed
 	case s.incoming <- packet{data: pkt}:
 		return nil
+	default:
+		return errSessionQueueFull
 	}
 }
 

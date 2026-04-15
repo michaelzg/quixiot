@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -26,9 +27,27 @@ func TestLoadProfileNamed(t *testing.T) {
 	if profile.Name != "wifi-good" {
 		t.Fatalf("profile name: want wifi-good got %q", profile.Name)
 	}
-	if filepath.Base(source) != "proxy-wifi-good.yaml" {
+	if source != "builtin:wifi-good" {
 		t.Fatalf("profile source: got %q", source)
 	}
+}
+
+func TestLoadProfileNamedFromUnrelatedWorkingDirectory(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Chdir(t.TempDir())
+
+	profile, source, err := loadProfile("flaky")
+	if err != nil {
+		t.Fatalf("loadProfile from temp dir: %v", err)
+	}
+	if profile.Name != "flaky" || source != "builtin:flaky" {
+		t.Fatalf("loadProfile from temp dir: got name=%q source=%q", profile.Name, source)
+	}
+
+	t.Chdir(wd)
 }
 
 func TestResolveProfilePathYAML(t *testing.T) {
