@@ -6,16 +6,23 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"quixiot/internal/config"
 	"quixiot/internal/logging"
+	"quixiot/internal/server"
 	"quixiot/internal/tlsutil"
 )
+
+const buildVersion = "dev"
 
 type serverConfig struct {
 	Addr      string `yaml:"addr"`
@@ -111,13 +118,37 @@ func run(args []string) error {
 		return nil
 	}
 
-	log.Info("server: listener lands in phase 3",
-		"addr", cfg.Addr,
+	tlsConf, err := tlsutil.LoadServerTLS(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return err
+	}
+	pc, err := net.ListenPacket("udp", cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("server: listen %s: %w", cfg.Addr, err)
+	}
+	defer pc.Close()
+
+	srv, err := server.New(server.Options{
+		PacketConn: pc,
+		TLSConfig:  tlsConf,
+		Logger:     log,
+		Version:    buildVersion,
+	})
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	log.Info("server listening",
+		"addr", pc.LocalAddr().String(),
 		"cert_file", cfg.CertFile,
 		"key_file", cfg.KeyFile,
 		"upload_dir", cfg.UploadDir,
 	)
-	return nil
+	return srv.Serve(ctx)
 }
 
 func splitSANs(s string) []string {
