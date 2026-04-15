@@ -35,6 +35,7 @@ func TestServerEndpointsOverHTTP3(t *testing.T) {
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Version:    "test-version",
 		StartedAt:  time.Now().Add(-2 * time.Second).UTC(),
+		UploadDir:  t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -95,5 +96,13 @@ func TestServerEndpointsOverHTTP3(t *testing.T) {
 	}
 	if cfg.CommandTopic != "clients/device-123/commands" {
 		t.Fatalf("command topic mismatch: %q", cfg.CommandTopic)
+	}
+
+	result, err := c.UploadDeterministic(context.Background(), "device-123-000.bin", 4096, 7)
+	if err != nil {
+		t.Fatalf("UploadDeterministic: %v", err)
+	}
+	if result.Bytes != 4096 {
+		t.Fatalf("upload bytes: want 4096 got %d", result.Bytes)
 	}
 }

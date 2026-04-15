@@ -133,6 +133,7 @@ func run(args []string) error {
 		TLSConfig:  tlsConf,
 		Logger:     log,
 		Version:    buildVersion,
+		UploadDir:  cfg.UploadDir,
 	})
 	if err != nil {
 		return err

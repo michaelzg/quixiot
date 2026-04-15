@@ -17,6 +17,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 
 	"quixiot/internal/logging"
+	"quixiot/internal/upload"
 )
 
 const (
@@ -35,6 +36,7 @@ type Options struct {
 	Logger     *slog.Logger
 	Version    string
 	StartedAt  time.Time
+	UploadDir  string
 }
 
 type Server struct {
@@ -75,6 +77,10 @@ func New(opts Options) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	uploadDir := opts.UploadDir
+	if uploadDir == "" {
+		uploadDir = "var/uploads"
+	}
 	version := opts.Version
 	if version == "" {
 		version = defaultVersion
@@ -94,6 +100,10 @@ func New(opts Options) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /state", s.handleState)
 	mux.HandleFunc("GET /config/{clientID}", s.handleConfig)
+	mux.Handle("POST /files/{name}", upload.Handler{
+		Dir:    uploadDir,
+		Logger: log,
+	})
 
 	s.transport = &quic.Transport{Conn: opts.PacketConn}
 	listener, err := s.transport.ListenEarly(http3.ConfigureTLSConfig(opts.TLSConfig), quicConfig())

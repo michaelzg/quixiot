@@ -16,22 +16,26 @@ import (
 )
 
 type clientConfig struct {
-	ServerURL    string        `yaml:"server_url"`
-	CAFile       string        `yaml:"ca_file"`
-	ClientID     string        `yaml:"client_id"`
-	Role         string        `yaml:"role"`
-	PollInterval time.Duration `yaml:"poll_interval"`
-	LogLevel     string        `yaml:"log_level"`
+	ServerURL      string        `yaml:"server_url"`
+	CAFile         string        `yaml:"ca_file"`
+	ClientID       string        `yaml:"client_id"`
+	Role           string        `yaml:"role"`
+	PollInterval   time.Duration `yaml:"poll_interval"`
+	UploadInterval time.Duration `yaml:"upload_interval"`
+	UploadSize     int64         `yaml:"upload_size"`
+	LogLevel       string        `yaml:"log_level"`
 }
 
 func defaults() clientConfig {
 	return clientConfig{
-		ServerURL:    "https://localhost:4444",
-		CAFile:       "var/certs/ca.pem",
-		ClientID:     "client-local",
-		Role:         "poller",
-		PollInterval: 5 * time.Second,
-		LogLevel:     "info",
+		ServerURL:      "https://localhost:4444",
+		CAFile:         "var/certs/ca.pem",
+		ClientID:       "client-local",
+		Role:           "poller",
+		PollInterval:   5 * time.Second,
+		UploadInterval: 30 * time.Second,
+		UploadSize:     1 << 20,
+		LogLevel:       "info",
 	}
 }
 
@@ -50,8 +54,10 @@ func run(args []string) error {
 	serverURL := fs.String("server-url", def.ServerURL, "HTTP/3 server base URL")
 	caFile := fs.String("ca-file", def.CAFile, "CA certificate PEM path")
 	clientID := fs.String("client-id", def.ClientID, "logical client ID")
-	role := fs.String("role", def.Role, "client role: poller")
+	role := fs.String("role", def.Role, "client role: poller|uploader")
 	pollInterval := fs.Duration("poll-interval", def.PollInterval, "poll interval for role=poller")
+	uploadInterval := fs.Duration("upload-interval", def.UploadInterval, "upload interval for role=uploader")
+	uploadSize := fs.Int64("upload-size", def.UploadSize, "upload size in bytes for role=uploader")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
 
 	if err := fs.Parse(args); err != nil {
@@ -74,6 +80,10 @@ func run(args []string) error {
 			cfg.Role = *role
 		case "poll-interval":
 			cfg.PollInterval = *pollInterval
+		case "upload-interval":
+			cfg.UploadInterval = *uploadInterval
+		case "upload-size":
+			cfg.UploadSize = *uploadSize
 		case "log-level":
 			cfg.LogLevel = *logLevel
 		}
@@ -87,6 +97,7 @@ func run(args []string) error {
 
 	switch cfg.Role {
 	case "poller":
+	case "uploader":
 	default:
 		return fmt.Errorf("client: unsupported role %q", cfg.Role)
 	}
@@ -118,6 +129,21 @@ func run(args []string) error {
 			Logger:   log,
 		}
 		return poller.Run(ctx)
+	case "uploader":
+		log.Info("starting uploader",
+			"server_url", cfg.ServerURL,
+			"client_id", cfg.ClientID,
+			"upload_interval", cfg.UploadInterval.String(),
+			"upload_size", cfg.UploadSize,
+		)
+		uploader := roles.Uploader{
+			Client:   c,
+			ClientID: cfg.ClientID,
+			Interval: cfg.UploadInterval,
+			Size:     cfg.UploadSize,
+			Logger:   log,
+		}
+		return uploader.Run(ctx)
 	default:
 		return fmt.Errorf("client: unsupported role %q", cfg.Role)
 	}

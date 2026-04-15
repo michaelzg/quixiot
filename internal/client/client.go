@@ -2,10 +2,13 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -51,6 +54,12 @@ type DeviceConfig struct {
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
 	TelemetryTopic      string `json:"telemetry_topic"`
 	CommandTopic        string `json:"command_topic"`
+}
+
+type UploadResult struct {
+	Bytes          int64  `json:"bytes"`
+	SHA256         string `json:"sha256"`
+	DurationMillis int64  `json:"durationMs"`
 }
 
 func New(opts Options) (*Client, error) {
@@ -105,6 +114,53 @@ func (c *Client) GetConfig(ctx context.Context, clientID string) (DeviceConfig, 
 	path := fmt.Sprintf("/config/%s", url.PathEscape(clientID))
 	if err := c.getJSON(ctx, path, &out); err != nil {
 		return DeviceConfig{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) UploadDeterministic(ctx context.Context, name string, size int64, seed int64) (UploadResult, error) {
+	if name == "" {
+		return UploadResult{}, fmt.Errorf("client: upload name is required")
+	}
+	if size < 0 {
+		return UploadResult{}, fmt.Errorf("client: upload size must be non-negative")
+	}
+
+	expectedSHA, err := deterministicSHA256(size, seed)
+	if err != nil {
+		return UploadResult{}, err
+	}
+
+	path := fmt.Sprintf("/files/%s", url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, io.NopCloser(newDeterministicReader(size, seed)))
+	if err != nil {
+		return UploadResult{}, fmt.Errorf("client: build POST %s: %w", path, err)
+	}
+	req.ContentLength = size
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return UploadResult{}, fmt.Errorf("client: POST %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return UploadResult{}, fmt.Errorf("client: POST %s: unexpected status %s: %s", path, resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var out UploadResult
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&out); err != nil {
+		return UploadResult{}, fmt.Errorf("client: decode %s: %w", path, err)
+	}
+	if out.Bytes != size {
+		return UploadResult{}, fmt.Errorf("client: upload bytes mismatch: want %d got %d", size, out.Bytes)
+	}
+	if out.SHA256 != expectedSHA {
+		return UploadResult{}, fmt.Errorf("client: upload sha mismatch: want %s got %s", expectedSHA, out.SHA256)
 	}
 	return out, nil
 }
@@ -170,4 +226,42 @@ func (c *Client) getJSON(ctx context.Context, path string, target any) error {
 		return fmt.Errorf("client: decode %s: %w", path, err)
 	}
 	return nil
+}
+
+type deterministicReader struct {
+	remaining int64
+	rnd       *rand.Rand
+}
+
+func newDeterministicReader(size int64, seed int64) *deterministicReader {
+	return &deterministicReader{
+		remaining: size,
+		rnd:       rand.New(rand.NewSource(seed)),
+	}
+}
+
+func (r *deterministicReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.rnd.Read(p)
+	r.remaining -= int64(n)
+	if err != nil {
+		return n, err
+	}
+	if r.remaining == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func deterministicSHA256(size int64, seed int64) (string, error) {
+	h := sha256.New()
+	if _, err := io.Copy(h, newDeterministicReader(size, seed)); err != nil {
+		return "", fmt.Errorf("client: hash deterministic upload: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
