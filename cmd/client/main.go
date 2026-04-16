@@ -72,7 +72,7 @@ func run(args []string) error {
 	serverURL := fs.String("server-url", def.ServerURL, "HTTP/3 server base URL")
 	caFile := fs.String("ca-file", def.CAFile, "CA certificate PEM path")
 	clientID := fs.String("client-id", def.ClientID, "logical client ID")
-	role := fs.String("role", def.Role, "client role: poller|uploader|publisher|subscriber")
+	role := fs.String("role", def.Role, "client role: poller|uploader|publisher|subscriber|mixed")
 	pollInterval := fs.Duration("poll-interval", def.PollInterval, "poll interval for role=poller")
 	uploadInterval := fs.Duration("upload-interval", def.UploadInterval, "upload interval for role=uploader")
 	uploadSize := fs.Int64("upload-size", def.UploadSize, "upload size in bytes for role=uploader")
@@ -139,6 +139,7 @@ func run(args []string) error {
 	case "uploader":
 	case "publisher":
 	case "subscriber":
+	case "mixed":
 	default:
 		return fmt.Errorf("client: unsupported role %q", cfg.Role)
 	}
@@ -256,6 +257,65 @@ func run(args []string) error {
 			Metrics: clientMetrics,
 		}
 		return subscriber.Run(ctx)
+	case "mixed":
+		deviceCfg, err := c.GetConfig(ctx, cfg.ClientID)
+		if err != nil {
+			return fmt.Errorf("client: get config for mixed role: %w", err)
+		}
+		ps, err := c.ConnectPubSub(ctx, cfg.ClientID)
+		if err != nil {
+			return err
+		}
+		defer ps.Close()
+
+		telemetry := firstNonEmpty(cfg.TelemetryTopic, deviceCfg.TelemetryTopic)
+		command := firstNonEmpty(cfg.CommandTopic, deviceCfg.CommandTopic)
+		topics := splitList(cfg.SubscribeTopics)
+		if len(topics) == 0 {
+			topics = []string{telemetry, command}
+		}
+		log.Info("starting mixed role",
+			"server_url", cfg.ServerURL,
+			"client_id", cfg.ClientID,
+			"telemetry_topic", telemetry,
+			"command_topic", command,
+			"topics", topics,
+		)
+		mixed := roles.Mixed{
+			Poller: roles.Poller{
+				Client:   c,
+				ClientID: cfg.ClientID,
+				Interval: cfg.PollInterval,
+				Logger:   log,
+				Metrics:  clientMetrics,
+			},
+			Uploader: roles.Uploader{
+				Client:   c,
+				ClientID: cfg.ClientID,
+				Interval: cfg.UploadInterval,
+				Size:     cfg.UploadSize,
+				Logger:   log,
+				Metrics:  clientMetrics,
+			},
+			Publisher: roles.Publisher{
+				Session:           ps,
+				ClientID:          cfg.ClientID,
+				TelemetryTopic:    telemetry,
+				CommandTopic:      command,
+				TelemetryInterval: cfg.TelemetryInterval,
+				CommandInterval:   cfg.CommandInterval,
+				PayloadSize:       cfg.PubSubPayloadSize,
+				Logger:            log,
+				Metrics:           clientMetrics,
+			},
+			Subscriber: roles.Subscriber{
+				Session: ps,
+				Topics:  topics,
+				Logger:  log,
+				Metrics: clientMetrics,
+			},
+		}
+		return mixed.Run(ctx)
 	default:
 		return fmt.Errorf("client: unsupported role %q", cfg.Role)
 	}

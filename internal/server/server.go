@@ -30,9 +30,11 @@ const (
 	defaultPollIntervalSeconds        = 5
 	defaultMaxIdleTimeout             = 45 * time.Second
 	defaultInitialStreamReceiveWindow = 512 * 1024
-	defaultMaxStreamReceiveWindow     = 6 * 1024 * 1024
+	defaultMaxStreamReceiveWindow     = 8 * 1024 * 1024
 	defaultInitialConnReceiveWindow   = 1024 * 1024
-	defaultMaxConnReceiveWindow       = 15 * 1024 * 1024
+	defaultMaxConnReceiveWindow       = 16 * 1024 * 1024
+	defaultMaxIncomingStreams         = 1000
+	defaultMaxIncomingUniStreams      = 1000
 	pubsubProtocol                    = "quixiot-pubsub-v1"
 )
 
@@ -227,6 +229,8 @@ func quicConfig() *quic.Config {
 		MaxStreamReceiveWindow:           defaultMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow:   defaultInitialConnReceiveWindow,
 		MaxConnectionReceiveWindow:       defaultMaxConnReceiveWindow,
+		MaxIncomingStreams:               defaultMaxIncomingStreams,
+		MaxIncomingUniStreams:            defaultMaxIncomingUniStreams,
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true,
 	}
@@ -320,6 +324,38 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 	n, err := r.ResponseWriter.Write(p)
 	r.bytes += n
 	return n, err
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (r *statusRecorder) FlushError() error {
+	if flusher, ok := r.ResponseWriter.(interface{ FlushError() error }); ok {
+		return flusher.FlushError()
+	}
+	r.Flush()
+	return nil
+}
+
+func (r *statusRecorder) SetReadDeadline(deadline time.Time) error {
+	if controller, ok := r.ResponseWriter.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return controller.SetReadDeadline(deadline)
+	}
+	return http.ErrNotSupported
+}
+
+func (r *statusRecorder) SetWriteDeadline(deadline time.Time) error {
+	if controller, ok := r.ResponseWriter.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return controller.SetWriteDeadline(deadline)
+	}
+	return http.ErrNotSupported
 }
 
 func (r *statusRecorder) ReceivedSettings() <-chan struct{} {

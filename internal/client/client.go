@@ -26,9 +26,9 @@ const (
 	defaultMaxIdleTimeout             = 45 * time.Second
 	defaultKeepAlivePeriod            = 15 * time.Second
 	defaultInitialStreamReceiveWindow = 512 * 1024
-	defaultMaxStreamReceiveWindow     = 6 * 1024 * 1024
+	defaultMaxStreamReceiveWindow     = 8 * 1024 * 1024
 	defaultInitialConnReceiveWindow   = 1024 * 1024
-	defaultMaxConnReceiveWindow       = 15 * 1024 * 1024
+	defaultMaxConnReceiveWindow       = 16 * 1024 * 1024
 )
 
 type Options struct {
