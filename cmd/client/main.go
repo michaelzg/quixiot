@@ -4,15 +4,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"quixiot/internal/client"
 	"quixiot/internal/config"
 	"quixiot/internal/logging"
+	"quixiot/internal/metrics"
 	"quixiot/internal/roles"
 )
 
@@ -30,6 +36,7 @@ type clientConfig struct {
 	TelemetryTopic    string        `yaml:"telemetry_topic"`
 	CommandTopic      string        `yaml:"command_topic"`
 	SubscribeTopics   string        `yaml:"subscribe_topics"`
+	MetricsAddr       string        `yaml:"metrics_addr"`
 	LogLevel          string        `yaml:"log_level"`
 }
 
@@ -45,6 +52,7 @@ func defaults() clientConfig {
 		TelemetryInterval: 2 * time.Second,
 		CommandInterval:   7 * time.Second,
 		PubSubPayloadSize: 256,
+		MetricsAddr:       "",
 		LogLevel:          "info",
 	}
 }
@@ -74,6 +82,7 @@ func run(args []string) error {
 	telemetryTopic := fs.String("telemetry-topic", def.TelemetryTopic, "override telemetry topic for pubsub roles")
 	commandTopic := fs.String("command-topic", def.CommandTopic, "override command topic for pubsub roles")
 	subscribeTopics := fs.String("subscribe-topics", def.SubscribeTopics, "comma-separated topic list for role=subscriber (defaults to telemetry+command topics)")
+	metricsAddr := fs.String("metrics-addr", def.MetricsAddr, "Prometheus metrics listen address")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
 
 	if err := fs.Parse(args); err != nil {
@@ -112,6 +121,8 @@ func run(args []string) error {
 			cfg.CommandTopic = *commandTopic
 		case "subscribe-topics":
 			cfg.SubscribeTopics = *subscribeTopics
+		case "metrics-addr":
+			cfg.MetricsAddr = *metricsAddr
 		case "log-level":
 			cfg.LogLevel = *logLevel
 		}
@@ -132,10 +143,12 @@ func run(args []string) error {
 		return fmt.Errorf("client: unsupported role %q", cfg.Role)
 	}
 
+	clientMetrics := metrics.NewClient()
 	c, err := client.New(client.Options{
 		BaseURL: cfg.ServerURL,
 		CAFile:  cfg.CAFile,
 		Logger:  log,
+		Metrics: clientMetrics,
 	})
 	if err != nil {
 		return err
@@ -144,6 +157,9 @@ func run(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := startMetricsServer(ctx, cfg.MetricsAddr, clientMetrics.Registry, log); err != nil {
+		return err
+	}
 
 	switch cfg.Role {
 	case "poller":
@@ -157,6 +173,7 @@ func run(args []string) error {
 			ClientID: cfg.ClientID,
 			Interval: cfg.PollInterval,
 			Logger:   log,
+			Metrics:  clientMetrics,
 		}
 		return poller.Run(ctx)
 	case "uploader":
@@ -172,6 +189,7 @@ func run(args []string) error {
 			Interval: cfg.UploadInterval,
 			Size:     cfg.UploadSize,
 			Logger:   log,
+			Metrics:  clientMetrics,
 		}
 		return uploader.Run(ctx)
 	case "publisher":
@@ -205,6 +223,7 @@ func run(args []string) error {
 			CommandInterval:   cfg.CommandInterval,
 			PayloadSize:       cfg.PubSubPayloadSize,
 			Logger:            log,
+			Metrics:           clientMetrics,
 		}
 		return publisher.Run(ctx)
 	case "subscriber":
@@ -234,6 +253,7 @@ func run(args []string) error {
 			Session: ps,
 			Topics:  topics,
 			Logger:  log,
+			Metrics: clientMetrics,
 		}
 		return subscriber.Run(ctx)
 	default:
@@ -259,4 +279,29 @@ func splitList(raw string) []string {
 		}
 	}
 	return out
+}
+
+func startMetricsServer(ctx context.Context, addr string, reg *prometheus.Registry, log *slog.Logger) error {
+	if addr == "" {
+		return nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("client: listen metrics %q: %w", addr, err)
+	}
+	srv := &http.Server{
+		Handler: metrics.Handler(reg),
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Error("client metrics server failed", "addr", addr, "error", err)
+		}
+	}()
+	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"quixiot/internal/client"
+	"quixiot/internal/metrics"
 )
 
 type PollerClient interface {
@@ -19,6 +20,7 @@ type Poller struct {
 	ClientID string
 	Interval time.Duration
 	Logger   *slog.Logger
+	Metrics  *metrics.ClientMetrics
 }
 
 func (p Poller) Run(ctx context.Context) error {
@@ -53,6 +55,7 @@ func (p Poller) Run(ctx context.Context) error {
 }
 
 func (p Poller) PollOnce(ctx context.Context) error {
+	start := time.Now()
 	state, err := p.Client.GetState(ctx)
 	if err != nil {
 		return fmt.Errorf("poller: get state: %w", err)
@@ -70,6 +73,9 @@ func (p Poller) PollOnce(ctx context.Context) error {
 		"telemetry_topic", cfg.TelemetryTopic,
 		"command_topic", cfg.CommandTopic,
 	)
+	if p.Metrics != nil {
+		p.Metrics.PollDuration.Observe(time.Since(start).Seconds())
+	}
 	return nil
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/quic-go/webtransport-go"
 
+	"quixiot/internal/metrics"
 	"quixiot/internal/wire"
 )
 
@@ -38,6 +39,7 @@ type PubSubSession struct {
 	session *webtransport.Session
 	control *webtransport.Stream
 	logger  *slog.Logger
+	metrics *metrics.ClientMetrics
 
 	incoming chan PubSubMessage
 
@@ -60,6 +62,7 @@ func (c *Client) ConnectPubSub(ctx context.Context, clientID string) (*PubSubSes
 		TLSClientConfig:      tlsConf,
 		QUICConfig:           quicConfig(),
 		ApplicationProtocols: []string{pubsubProtocol},
+		DialAddr:             c.dialQUIC,
 	}
 
 	hdr := make(http.Header)
@@ -82,6 +85,7 @@ func (c *Client) ConnectPubSub(ctx context.Context, clientID string) (*PubSubSes
 		session:  sess,
 		control:  control,
 		logger:   c.logger.With("client_id", clientID),
+		metrics:  c.metrics,
 		incoming: make(chan PubSubMessage, 256),
 	}
 	go ps.readDatagrams()
@@ -124,6 +128,9 @@ func (p *PubSubSession) PublishDatagram(topic string, payload []byte) error {
 	}
 	if err := p.session.SendDatagram(data); err != nil {
 		return fmt.Errorf("client: send datagram: %w", err)
+	}
+	if p.metrics != nil {
+		p.metrics.Datagrams.WithLabelValues("out", topic).Inc()
 	}
 	return nil
 }
@@ -220,6 +227,9 @@ func (p *PubSubSession) deliver(frame wire.Frame, surface Surface) {
 		Topic:   frame.Topic,
 		Payload: append([]byte(nil), frame.Payload...),
 		Surface: surface,
+	}
+	if p.metrics != nil && surface == SurfaceDatagram {
+		p.metrics.Datagrams.WithLabelValues("in", frame.Topic).Inc()
 	}
 	select {
 	case p.incoming <- msg:

@@ -4,7 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,25 +14,30 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"quixiot/internal/config"
 	"quixiot/internal/impair"
 	"quixiot/internal/logging"
+	"quixiot/internal/metrics"
 	"quixiot/internal/proxy"
 )
 
 type proxyConfig struct {
-	Listen   string `yaml:"listen"`
-	Upstream string `yaml:"upstream"`
-	Profile  string `yaml:"profile"`
-	LogLevel string `yaml:"log_level"`
+	Listen      string `yaml:"listen"`
+	Upstream    string `yaml:"upstream"`
+	Profile     string `yaml:"profile"`
+	MetricsAddr string `yaml:"metrics_addr"`
+	LogLevel    string `yaml:"log_level"`
 }
 
 func defaults() proxyConfig {
 	return proxyConfig{
-		Listen:   "127.0.0.1:4443",
-		Upstream: "127.0.0.1:4444",
-		Profile:  "passthrough",
-		LogLevel: "info",
+		Listen:      "127.0.0.1:4443",
+		Upstream:    "127.0.0.1:4444",
+		Profile:     "passthrough",
+		MetricsAddr: "127.0.0.1:9104",
+		LogLevel:    "info",
 	}
 }
 
@@ -49,6 +56,7 @@ func run(args []string) error {
 	listen := fs.String("listen", def.Listen, "client-facing UDP listen address")
 	upstream := fs.String("upstream", def.Upstream, "upstream UDP address")
 	profile := fs.String("profile", def.Profile, "network profile: passthrough|wifi-good|cellular-lte|cellular-3g|satellite|flaky or a profile YAML path")
+	metricsAddr := fs.String("metrics-addr", def.MetricsAddr, "Prometheus metrics listen address")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
 
 	if err := fs.Parse(args); err != nil {
@@ -67,6 +75,8 @@ func run(args []string) error {
 			cfg.Upstream = *upstream
 		case "profile":
 			cfg.Profile = *profile
+		case "metrics-addr":
+			cfg.MetricsAddr = *metricsAddr
 		case "log-level":
 			cfg.LogLevel = *logLevel
 		}
@@ -98,11 +108,13 @@ func run(args []string) error {
 		return fmt.Errorf("proxy: resolve upstream addr %q: %w", cfg.Upstream, err)
 	}
 
+	proxyMetrics := metrics.NewProxy()
 	p, err := proxy.New(proxy.Options{
 		ListenConn:   listenConn,
 		UpstreamAddr: upstreamAddr,
 		Logger:       log,
 		Profile:      profileConfig,
+		Metrics:      proxyMetrics,
 	})
 	if err != nil {
 		_ = listenConn.Close()
@@ -112,6 +124,10 @@ func run(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := serveMetrics(ctx, cfg.MetricsAddr, proxyMetrics.Registry, log); err != nil {
+		_ = p.Close()
+		return err
+	}
 
 	log.Info("proxy listening",
 		"listen", listenConn.LocalAddr().String(),
@@ -119,6 +135,7 @@ func run(args []string) error {
 		"profile", profileConfig.Name,
 		"profile_source", profileSource,
 		"profile_seed", profileConfig.Seed,
+		"metrics_addr", cfg.MetricsAddr,
 		"idle_timeout", (5 * time.Minute).String(),
 	)
 	return p.Serve(ctx)
@@ -152,4 +169,29 @@ func resolveProfilePath(raw string) string {
 		return raw
 	}
 	return filepath.Join("configs", "proxy-"+raw+".yaml")
+}
+
+func serveMetrics(ctx context.Context, addr string, reg *prometheus.Registry, log *slog.Logger) error {
+	if addr == "" {
+		return nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("proxy: listen metrics %q: %w", addr, err)
+	}
+	srv := &http.Server{
+		Handler: metrics.Handler(reg),
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Error("proxy metrics server failed", "addr", addr, "error", err)
+		}
+	}()
+	return nil
 }

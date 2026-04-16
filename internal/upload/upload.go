@@ -15,8 +15,9 @@ import (
 )
 
 type Handler struct {
-	Dir    string
-	Logger *slog.Logger
+	Dir      string
+	Logger   *slog.Logger
+	OnStored func(Response)
 }
 
 type Response struct {
@@ -86,6 +87,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"sha256", resp.SHA256,
 			"duration_ms", resp.DurationMillis,
 		)
+	}
+	if h.OnStored != nil {
+		h.OnStored(resp)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

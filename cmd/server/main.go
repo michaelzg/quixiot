@@ -18,6 +18,7 @@ import (
 
 	"quixiot/internal/config"
 	"quixiot/internal/logging"
+	"quixiot/internal/metrics"
 	"quixiot/internal/server"
 	"quixiot/internal/tlsutil"
 )
@@ -134,6 +135,7 @@ func run(args []string) error {
 		Logger:     log,
 		Version:    buildVersion,
 		UploadDir:  cfg.UploadDir,
+		Metrics:    metrics.NewServer(),
 	})
 	if err != nil {
 		return err

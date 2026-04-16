@@ -29,10 +29,18 @@ type Profile struct {
 type Pipeline struct {
 	cfg            DirectionConfig
 	rng            *rand.Rand
+	hooks          Hooks
 	queue          packetHeap
 	held           *heldPacket
 	nextSeq        uint64
 	bandwidthReady time.Time
+}
+
+type Hooks struct {
+	OnDrop      func()
+	OnDuplicate func()
+	OnReorder   func()
+	OnDelay     func(time.Duration)
 }
 
 type heldPacket struct {
@@ -97,12 +105,17 @@ func (c DirectionConfig) Validate(field string) error {
 }
 
 func NewPipeline(cfg DirectionConfig, seed int64) (*Pipeline, error) {
+	return NewPipelineWithHooks(cfg, seed, Hooks{})
+}
+
+func NewPipelineWithHooks(cfg DirectionConfig, seed int64, hooks Hooks) (*Pipeline, error) {
 	if err := cfg.Validate("direction"); err != nil {
 		return nil, err
 	}
 	return &Pipeline{
-		cfg: cfg,
-		rng: rand.New(rand.NewSource(seed)),
+		cfg:   cfg,
+		rng:   rand.New(rand.NewSource(seed)),
+		hooks: hooks,
 	}, nil
 }
 
@@ -112,12 +125,18 @@ func (p *Pipeline) Enqueue(now time.Time, data []byte) {
 	}
 	p.flushExpiredHeld(now)
 	if p.roll(p.cfg.DropProbability) {
+		if p.hooks.OnDrop != nil {
+			p.hooks.OnDrop()
+		}
 		return
 	}
 
 	copies := 1
 	if p.roll(p.cfg.DuplicateProbability) {
 		copies++
+		if p.hooks.OnDuplicate != nil {
+			p.hooks.OnDuplicate()
+		}
 	}
 	for range copies {
 		p.enqueueCopy(now, data)
@@ -173,6 +192,9 @@ func (p *Pipeline) ReleaseReady(now time.Time) [][]byte {
 
 func (p *Pipeline) enqueueCopy(now time.Time, data []byte) {
 	if p.held == nil && p.roll(p.cfg.ReorderProbability) {
+		if p.hooks.OnReorder != nil {
+			p.hooks.OnReorder()
+		}
 		p.held = &heldPacket{
 			data:      data,
 			releaseAt: now.Add(p.reorderHold()),
@@ -212,6 +234,9 @@ func (p *Pipeline) schedule(now time.Time, data []byte) {
 		}
 		releaseAt = releaseAt.Add(transmitDuration(len(data), p.cfg.BandwidthBytesPerSec))
 		p.bandwidthReady = releaseAt
+	}
+	if p.hooks.OnDelay != nil {
+		p.hooks.OnDelay(releaseAt.Sub(now))
 	}
 
 	heap.Push(&p.queue, scheduledPacket{

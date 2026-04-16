@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"quixiot/internal/metrics"
 )
 
 type PublisherSession interface {
@@ -21,6 +23,7 @@ type Publisher struct {
 	CommandInterval   time.Duration
 	PayloadSize       int
 	Logger            *slog.Logger
+	Metrics           *metrics.ClientMetrics
 }
 
 func (p Publisher) Run(ctx context.Context) error {
@@ -66,7 +69,7 @@ func (p Publisher) Run(ctx context.Context) error {
 }
 
 func (p Publisher) publishTelemetry() error {
-	payload := []byte(fmt.Sprintf("%s telemetry %d", p.ClientID, time.Now().UnixMilli()))
+	payload := []byte(stampedPayload(p.ClientID, "telemetry"))
 	if p.PayloadSize > len(payload) {
 		payload = append(payload, make([]byte, p.PayloadSize-len(payload))...)
 	}
@@ -78,7 +81,7 @@ func (p Publisher) publishTelemetry() error {
 }
 
 func (p Publisher) publishCommand(ctx context.Context) error {
-	payload := []byte(fmt.Sprintf("%s command %d", p.ClientID, time.Now().UnixMilli()))
+	payload := []byte(stampedPayload(p.ClientID, "command"))
 	if err := p.Session.PublishStream(ctx, p.CommandTopic, payload); err != nil {
 		return fmt.Errorf("publisher: command stream: %w", err)
 	}
@@ -91,4 +94,8 @@ func (p Publisher) logger() *slog.Logger {
 		return p.Logger
 	}
 	return slog.Default()
+}
+
+func stampedPayload(clientID, kind string) string {
+	return fmt.Sprintf("ts=%d;client=%s;kind=%s", time.Now().UnixNano(), clientID, kind)
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"quixiot/internal/impair"
+	"quixiot/internal/metrics"
 )
 
 const (
@@ -33,6 +34,7 @@ type Options struct {
 	IdleTimeout  time.Duration
 	DialUDP      func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
 	Profile      impair.Profile
+	Metrics      *metrics.ProxyMetrics
 }
 
 type Proxy struct {
@@ -42,6 +44,7 @@ type Proxy struct {
 	idleTimeout  time.Duration
 	dialUDP      func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
 	profile      impair.Profile
+	metrics      *metrics.ProxyMetrics
 
 	sessionsMu sync.Mutex
 	sessions   map[netip.AddrPort]*session
@@ -73,6 +76,7 @@ type session struct {
 	lastSeen  atomic.Int64
 	closeOnce sync.Once
 	done      chan struct{}
+	onClose   func()
 }
 
 func New(opts Options) (*Proxy, error) {
@@ -107,6 +111,7 @@ func New(opts Options) (*Proxy, error) {
 		idleTimeout:  idleTimeout,
 		dialUDP:      pickDialUDP(opts.DialUDP),
 		profile:      profile,
+		metrics:      opts.Metrics,
 		sessions:     make(map[netip.AddrPort]*session),
 		closed:       make(chan struct{}),
 	}, nil
@@ -147,6 +152,10 @@ func (p *Proxy) Serve(ctx context.Context) error {
 				"error", err,
 			)
 			continue
+		}
+		if p.metrics != nil {
+			p.metrics.Packets.WithLabelValues("to_server").Inc()
+			p.metrics.Bytes.WithLabelValues("to_server").Add(float64(n))
 		}
 		if err := sess.enqueueIncoming(copyPacket(buf[:n])); err != nil {
 			if p.isClosed() {
@@ -202,12 +211,12 @@ func (p *Proxy) getOrCreateSession(key netip.AddrPort, clientAddr *net.UDPAddr) 
 		_ = upstreamConn.Close()
 		return nil, fmt.Errorf("proxy: set upstream read buffer: %w", err)
 	}
-	toServerPipeline, err := impair.NewPipeline(p.profile.ToServer, sessionSeed(p.profile.Seed, key, "to-server"))
+	toServerPipeline, err := impair.NewPipelineWithHooks(p.profile.ToServer, sessionSeed(p.profile.Seed, key, "to-server"), p.pipelineHooks("to_server"))
 	if err != nil {
 		_ = upstreamConn.Close()
 		return nil, err
 	}
-	toClientPipeline, err := impair.NewPipeline(p.profile.ToClient, sessionSeed(p.profile.Seed, key, "to-client"))
+	toClientPipeline, err := impair.NewPipelineWithHooks(p.profile.ToClient, sessionSeed(p.profile.Seed, key, "to-client"), p.pipelineHooks("to_client"))
 	if err != nil {
 		_ = upstreamConn.Close()
 		return nil, err
@@ -227,6 +236,13 @@ func (p *Proxy) getOrCreateSession(key netip.AddrPort, clientAddr *net.UDPAddr) 
 		toServerPipeline: toServerPipeline,
 		toClientPipeline: toClientPipeline,
 		done:             make(chan struct{}),
+	}
+	if p.metrics != nil {
+		p.metrics.SessionsActive.Inc()
+		p.metrics.SessionsTotal.Inc()
+		sess.onClose = func() {
+			p.metrics.SessionsActive.Dec()
+		}
 	}
 	sess.touch()
 
@@ -323,6 +339,10 @@ func (s *session) returnReadLoop() {
 		}
 
 		s.touch()
+		if s.owner.metrics != nil {
+			s.owner.metrics.Packets.WithLabelValues("to_client").Inc()
+			s.owner.metrics.Bytes.WithLabelValues("to_client").Add(float64(n))
+		}
 		select {
 		case <-s.done:
 			return
@@ -421,6 +441,9 @@ func (s *session) close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {
 		close(s.done)
+		if s.onClose != nil {
+			s.onClose()
+		}
 		if err := s.upstreamConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			closeErr = err
 		}
@@ -492,4 +515,26 @@ func sessionSeed(base int64, key netip.AddrPort, direction string) int64 {
 	_, _ = hasher.Write([]byte{0})
 	_, _ = hasher.Write([]byte(direction))
 	return int64(hasher.Sum64() ^ uint64(base))
+}
+
+func (p *Proxy) pipelineHooks(direction string) impair.Hooks {
+	if p.metrics == nil {
+		return impair.Hooks{}
+	}
+	return impair.Hooks{
+		OnDrop: func() {
+			p.metrics.Drops.WithLabelValues(direction).Inc()
+		},
+		OnDuplicate: func() {
+			p.metrics.Duplicates.WithLabelValues(direction).Inc()
+		},
+		OnReorder: func() {
+			p.metrics.Reorders.WithLabelValues(direction).Inc()
+		},
+		OnDelay: func(delay time.Duration) {
+			if delay > 0 {
+				p.metrics.EnforcedDelay.WithLabelValues(direction).Observe(delay.Seconds())
+			}
+		},
+	}
 }

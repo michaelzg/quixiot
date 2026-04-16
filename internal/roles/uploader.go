@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"quixiot/internal/client"
+	"quixiot/internal/metrics"
 )
 
 type UploaderClient interface {
@@ -20,6 +21,7 @@ type Uploader struct {
 	Interval time.Duration
 	Size     int64
 	Logger   *slog.Logger
+	Metrics  *metrics.ClientMetrics
 }
 
 func (u Uploader) Run(ctx context.Context) error {
@@ -58,6 +60,7 @@ func (u Uploader) Run(ctx context.Context) error {
 }
 
 func (u Uploader) UploadOnce(ctx context.Context, seq int64) error {
+	start := time.Now()
 	name := fmt.Sprintf("%s-%03d.bin", safeID(u.ClientID), seq)
 	seed := seq + 1
 	resp, err := u.Client.UploadDeterministic(ctx, name, u.Size, seed)
@@ -71,6 +74,9 @@ func (u Uploader) UploadOnce(ctx context.Context, seq int64) error {
 		"sha256", resp.SHA256,
 		"duration_ms", resp.DurationMillis,
 	)
+	if u.Metrics != nil {
+		u.Metrics.UploadDuration.Observe(time.Since(start).Seconds())
+	}
 	return nil
 }
 

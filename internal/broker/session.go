@@ -90,6 +90,9 @@ func (s *Session) readControl(str *webtransport.Stream) {
 			s.logger.Warn("read control frame failed", "error", err)
 			return
 		}
+		if s.broker.metrics != nil {
+			s.broker.metrics.Streams.WithLabelValues("control", "in").Inc()
+		}
 		switch frame.Kind {
 		case wire.KindSub:
 			s.subscribe(frame.Topic)
@@ -113,15 +116,24 @@ func (s *Session) datagramReader() {
 			return
 		}
 		if len(data) > maxDatagramBytes {
+			if s.broker.metrics != nil {
+				s.broker.metrics.PubSubDrops.WithLabelValues("wt_datagram", "", "incoming_oversize").Inc()
+			}
 			s.logger.Warn("drop oversized incoming datagram", "bytes", len(data))
 			continue
 		}
 		frame, err := wire.Decode(data)
 		if err != nil {
+			if s.broker.metrics != nil {
+				s.broker.metrics.PubSubDrops.WithLabelValues("wt_datagram", "", "incoming_invalid").Inc()
+			}
 			s.logger.Warn("drop invalid incoming datagram", "error", err)
 			continue
 		}
 		if frame.Kind != wire.KindPub {
+			if s.broker.metrics != nil {
+				s.broker.metrics.PubSubDrops.WithLabelValues("wt_datagram", frame.Topic, "incoming_non_pub").Inc()
+			}
 			s.logger.Warn("drop non-pub datagram", "kind", frame.Kind, "topic", frame.Topic)
 			continue
 		}
@@ -141,12 +153,18 @@ func (s *Session) datagramWriter() {
 				continue
 			}
 			if len(data) > maxDatagramBytes {
+				if s.broker.metrics != nil {
+					s.broker.metrics.PubSubDrops.WithLabelValues("wt_datagram", frame.Topic, "outgoing_oversize").Inc()
+				}
 				s.logger.Warn("drop oversized outgoing datagram", "topic", frame.Topic, "bytes", len(data))
 				continue
 			}
 			if err := s.wt.SendDatagram(data); err != nil {
 				s.logger.Warn("send datagram failed", "topic", frame.Topic, "error", err)
 				return
+			}
+			if s.broker.metrics != nil {
+				s.broker.metrics.Bytes.WithLabelValues("wt_datagram", "out").Add(float64(len(frame.Payload)))
 			}
 		}
 	}
@@ -163,10 +181,16 @@ func (s *Session) streamWriter() {
 				s.logger.Warn("open uni stream failed", "topic", frame.Topic, "error", err)
 				return
 			}
+			if s.broker.metrics != nil {
+				s.broker.metrics.Streams.WithLabelValues("delivery", "out").Inc()
+			}
 			if err := wire.WriteStreamFrame(str, frame); err != nil {
 				s.logger.Warn("write uni stream frame failed", "topic", frame.Topic, "error", err)
 				_ = str.Close()
 				continue
+			}
+			if s.broker.metrics != nil {
+				s.broker.metrics.Bytes.WithLabelValues("wt_stream", "out").Add(float64(len(frame.Payload)))
 			}
 			if err := str.Close(); err != nil {
 				s.logger.Warn("close uni stream failed", "topic", frame.Topic, "error", err)

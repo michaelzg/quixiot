@@ -18,6 +18,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 
+	"quixiot/internal/metrics"
 	"quixiot/internal/tlsutil"
 )
 
@@ -34,6 +35,7 @@ type Options struct {
 	BaseURL string
 	CAFile  string
 	Logger  *slog.Logger
+	Metrics *metrics.ClientMetrics
 }
 
 type Client struct {
@@ -41,6 +43,7 @@ type Client struct {
 	httpClient *http.Client
 	transport  *http3.Transport
 	tlsConfig  *tls.Config
+	metrics    *metrics.ClientMetrics
 	logger     *slog.Logger
 }
 
@@ -86,19 +89,22 @@ func New(opts Options) (*Client, error) {
 		log = slog.Default()
 	}
 
+	c := &Client{
+		baseURL:   baseURL,
+		tlsConfig: tlsConf,
+		metrics:   opts.Metrics,
+		logger:    log,
+	}
 	transport := &http3.Transport{
 		TLSClientConfig: tlsConf,
 		QUICConfig:      quicConfig(),
 		EnableDatagrams: true,
 		Logger:          log,
+		Dial:            c.dialQUIC,
 	}
-	return &Client{
-		baseURL:    baseURL,
-		httpClient: &http.Client{Transport: transport},
-		transport:  transport,
-		tlsConfig:  tlsConf,
-		logger:     log,
-	}, nil
+	c.httpClient = &http.Client{Transport: transport}
+	c.transport = transport
+	return c, nil
 }
 
 func (c *Client) GetState(ctx context.Context) (State, error) {
@@ -268,4 +274,35 @@ func deterministicSHA256(size int64, seed int64) (string, error) {
 		return "", fmt.Errorf("client: hash deterministic upload: %w", err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (c *Client) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+	start := time.Now()
+	conn, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if c.metrics != nil {
+		go func() {
+			select {
+			case <-conn.HandshakeComplete():
+				c.metrics.HandshakeDuration.Observe(time.Since(start).Seconds())
+			case <-conn.Context().Done():
+				return
+			}
+
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				stats := conn.ConnectionStats()
+				c.metrics.RTT.Set(stats.SmoothedRTT.Seconds())
+				select {
+				case <-conn.Context().Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
+	return conn, nil
 }

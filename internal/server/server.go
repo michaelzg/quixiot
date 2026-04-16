@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,7 @@ import (
 
 	"quixiot/internal/broker"
 	"quixiot/internal/logging"
+	"quixiot/internal/metrics"
 	"quixiot/internal/upload"
 )
 
@@ -41,6 +43,7 @@ type Options struct {
 	Version    string
 	StartedAt  time.Time
 	UploadDir  string
+	Metrics    *metrics.ServerMetrics
 }
 
 type Server struct {
@@ -50,6 +53,7 @@ type Server struct {
 	http3      *http3.Server
 	wt         *webtransport.Server
 	broker     *broker.Broker
+	metrics    *metrics.ServerMetrics
 	logger     *slog.Logger
 	version    string
 	startedAt  time.Time
@@ -101,8 +105,9 @@ func New(opts Options) (*Server, error) {
 		logger:     log,
 		version:    version,
 		startedAt:  startedAt,
-		broker:     broker.New(log),
+		metrics:    opts.Metrics,
 	}
+	s.broker = broker.New(log, s.metrics)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /state", s.handleState)
@@ -110,8 +115,18 @@ func New(opts Options) (*Server, error) {
 	mux.Handle("POST /files/{name}", upload.Handler{
 		Dir:    uploadDir,
 		Logger: log,
+		OnStored: func(resp upload.Response) {
+			if s.metrics == nil {
+				return
+			}
+			s.metrics.UploadBytes.Observe(float64(resp.Bytes))
+			s.metrics.UploadDuration.Observe(float64(resp.DurationMillis) / 1000)
+		},
 	})
 	mux.HandleFunc("CONNECT /pubsub", s.handlePubSub)
+	if s.metrics != nil {
+		mux.Handle("/metrics", metrics.Handler(s.metrics.Registry))
+	}
 
 	s.transport = &quic.Transport{Conn: opts.PacketConn}
 	listener, err := s.transport.ListenEarly(http3.ConfigureTLSConfig(opts.TLSConfig), quicConfig())
@@ -121,12 +136,34 @@ func New(opts Options) (*Server, error) {
 	}
 	s.listener = listener
 	s.http3 = &http3.Server{
-		Handler:         mux,
+		Handler:         s.instrumentHTTP(mux),
 		QUICConfig:      quicConfig(),
 		EnableDatagrams: true,
 		Logger:          log,
 	}
 	webtransport.ConfigureHTTP3Server(s.http3)
+	origConnContext := s.http3.ConnContext
+	s.http3.ConnContext = func(ctx context.Context, conn *quic.Conn) context.Context {
+		if origConnContext != nil {
+			ctx = origConnContext(ctx, conn)
+		}
+		if s.metrics != nil {
+			start := time.Now()
+			s.metrics.ConnectionsActive.Inc()
+			s.metrics.ConnectionsTotal.Inc()
+			go func() {
+				select {
+				case <-conn.HandshakeComplete():
+					s.metrics.HandshakeDuration.Observe(time.Since(start).Seconds())
+				case <-conn.Context().Done():
+				}
+			}()
+			context.AfterFunc(conn.Context(), func() {
+				s.metrics.ConnectionsActive.Dec()
+			})
+		}
+		return ctx
+	}
 	s.wt = &webtransport.Server{
 		H3:                   s.http3,
 		ApplicationProtocols: []string{pubsubProtocol},
@@ -229,6 +266,83 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePubSub(w http.ResponseWriter, r *http.Request) {
 	s.requestLogger(r).Info("upgrading pubsub session")
 	s.broker.HandleRequest(w, r, s.wt)
+}
+
+func (s *Server) instrumentHTTP(next http.Handler) http.Handler {
+	if s.metrics == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+
+		path := routeLabel(r)
+		s.metrics.HTTPDuration.WithLabelValues(r.Method, path, strconv.Itoa(rec.status)).Observe(time.Since(start).Seconds())
+		if r.ContentLength > 0 {
+			s.metrics.Bytes.WithLabelValues("h3", "in").Add(float64(r.ContentLength))
+		}
+		if rec.bytes > 0 {
+			s.metrics.Bytes.WithLabelValues("h3", "out").Add(float64(rec.bytes))
+		}
+	})
+}
+
+func routeLabel(r *http.Request) string {
+	if r == nil {
+		return "/"
+	}
+	pattern := r.Pattern
+	if idx := strings.IndexByte(pattern, ' '); idx >= 0 {
+		pattern = pattern[idx+1:]
+	}
+	if pattern != "" {
+		return pattern
+	}
+	if r.URL != nil && r.URL.Path != "" {
+		return r.URL.Path
+	}
+	return "/"
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += n
+	return n, err
+}
+
+func (r *statusRecorder) ReceivedSettings() <-chan struct{} {
+	if settingser, ok := r.ResponseWriter.(http3.Settingser); ok {
+		return settingser.ReceivedSettings()
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func (r *statusRecorder) Settings() *http3.Settings {
+	if settingser, ok := r.ResponseWriter.(http3.Settingser); ok {
+		return settingser.Settings()
+	}
+	return nil
+}
+
+func (r *statusRecorder) HTTPStream() *http3.Stream {
+	if streamer, ok := r.ResponseWriter.(http3.HTTPStreamer); ok {
+		return streamer.HTTPStream()
+	}
+	return nil
 }
 
 func (s *Server) requestLogger(r *http.Request) *slog.Logger {

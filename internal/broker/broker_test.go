@@ -9,7 +9,7 @@ import (
 )
 
 func TestBrokerPublishesToSubscribers(t *testing.T) {
-	b := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b := New(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	a := &Session{
 		broker:      b,
 		outDatagram: make(chan wire.Frame, 1),

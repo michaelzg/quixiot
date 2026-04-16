@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
+	"time"
 
 	"quixiot/internal/client"
+	"quixiot/internal/metrics"
 )
 
 type SubscriberSession interface {
@@ -17,6 +21,7 @@ type Subscriber struct {
 	Session SubscriberSession
 	Topics  []string
 	Logger  *slog.Logger
+	Metrics *metrics.ClientMetrics
 }
 
 func (s Subscriber) Run(ctx context.Context) error {
@@ -50,6 +55,11 @@ func (s Subscriber) Run(ctx context.Context) error {
 				"bytes", len(msg.Payload),
 				"count", counts[msg.Topic],
 			)
+			if s.Metrics != nil {
+				if ts, ok := parseStampedPayload(string(msg.Payload)); ok {
+					s.Metrics.PublishLatency.Observe(time.Since(time.Unix(0, ts)).Seconds())
+				}
+			}
 		}
 	}
 }
@@ -59,4 +69,18 @@ func (s Subscriber) logger() *slog.Logger {
 		return s.Logger
 	}
 	return slog.Default()
+}
+
+func parseStampedPayload(raw string) (int64, bool) {
+	for _, part := range strings.Split(raw, ";") {
+		if !strings.HasPrefix(part, "ts=") {
+			continue
+		}
+		ts, err := strconv.ParseInt(strings.TrimPrefix(part, "ts="), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return ts, true
+	}
+	return 0, false
 }
