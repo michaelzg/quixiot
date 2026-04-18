@@ -47,6 +47,7 @@ type ProxyMetrics struct {
 	Duplicates     *prometheus.CounterVec
 	Reorders       *prometheus.CounterVec
 	EnforcedDelay  *prometheus.HistogramVec
+	ProfileInfo    *prometheus.GaugeVec
 }
 
 func NewServer() *ServerMetrics {
@@ -224,6 +225,11 @@ func NewProxy() *ProxyMetrics {
 			Help:      "Enforced impairment delay in seconds by direction.",
 			Buckets:   prometheus.DefBuckets,
 		}, []string{"direction"}),
+		ProfileInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "proxy_profile_info",
+			Help:      "Static info metric with the name of the impairment profile currently loaded by the proxy. Always 1 for the active profile; missing for unloaded profiles. Use with label_values() or for annotations on profile swaps.",
+		}, []string{"name"}),
 	}
 	register(reg,
 		m.SessionsActive,
@@ -234,6 +240,7 @@ func NewProxy() *ProxyMetrics {
 		m.Duplicates,
 		m.Reorders,
 		m.EnforcedDelay,
+		m.ProfileInfo,
 	)
 	return m
 }

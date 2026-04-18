@@ -19,6 +19,18 @@
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
         "type": "dashboard"
+      },
+      {
+        "name": "Profile change",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "purple",
+        "expr": "quixiot_proxy_profile_info unless (quixiot_proxy_profile_info offset 1m)",
+        "titleFormat": "Profile → {{name}}",
+        "textFormat": "proxy loaded the {{name}} impairment profile",
+        "tagKeys": "name",
+        "step": "10s"
       }
     ]
   },
@@ -72,10 +84,38 @@
       "id": 1000,
       "type": "text",
       "title": "",
-      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 5},
+      "gridPos": {"x": 0, "y": 0, "w": 20, "h": 5},
       "options": {
         "mode": "markdown",
         "content": "## What this dashboard shows\n\nA Go IoT client fleet talks to a server over **one QUIC connection per client**, through an intermediate proxy that injects packet loss, latency, jitter, duplicates, reorders, and bandwidth limits. Each connection carries three simultaneous workloads:\n\n- **Real-time messages (pubsub)** — WebTransport datagrams (unreliable) + streams (reliable)\n- **File uploads** — streaming HTTP/3 POST with SHA-256 verification\n- **State polling** — plain HTTP/3 GET on a ticker\n\nThe proxy is switched between five impairment profiles: `wifi-good`, `cellular-lte`, `cellular-3g`, `satellite`, `flaky` (15% loss). The headline question the dashboard answers: **does one QUIC connection survive every profile without tearing down and reconnecting?** (spoiler — yes; watch `Reconnects` stay at 0)."
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Active profile",
+      "description": "Name of the impairment profile currently loaded by the proxy, from `quixiot_proxy_profile_info`. A purple annotation line appears on every time-series panel whenever this changes (e.g. via `make restart PROFILE=...`), making before/after comparison obvious.",
+      "gridPos": {"x": 20, "y": 0, "w": 4, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{
+        "refId": "A",
+        "expr": "quixiot_proxy_profile_info",
+        "legendFormat": "{{name}}",
+        "instant": false
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "purple", "value": null}]},
+          "mappings": []
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
       }
     },
 

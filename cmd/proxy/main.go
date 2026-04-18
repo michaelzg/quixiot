@@ -109,6 +109,9 @@ func run(args []string) error {
 	}
 
 	proxyMetrics := metrics.NewProxy()
+	// Publish the active profile as a Prometheus info metric so Grafana can
+	// surface the current profile name and draw an annotation on changes.
+	proxyMetrics.ProfileInfo.WithLabelValues(profileConfig.Name).Set(1)
 	p, err := proxy.New(proxy.Options{
 		ListenConn:   listenConn,
 		UpstreamAddr: upstreamAddr,
