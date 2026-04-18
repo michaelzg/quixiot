@@ -101,15 +101,15 @@ make grafana                    # default 1 day retention
 PROM_RETENTION=24h make grafana # override (e.g. 24h, 7d)
 ```
 
-Start the workload stack (quixiot binaries, background):
+Start the workload (quixiot binaries, background):
 
 ```sh
-make stack-up                              # server + cellular-3g proxy + 10 mixed clients
-PROFILE=flaky COUNT=20 make stack-up       # override profile / size
-make stack-status                          # RUNNING / stopped per component
-make stack-logs                            # tail -F server + proxy + fleet
-make stack-restart PROFILE=satellite       # swap profiles without losing Prometheus history
-make stack-down                            # SIGINT everything
+make up                              # server + cellular-3g proxy + 10 mixed clients
+PROFILE=flaky COUNT=20 make up       # override profile / size
+make status                          # RUNNING / stopped per component
+make logs                            # tail -F server + proxy + fleet
+make restart PROFILE=satellite       # swap profiles without losing Prometheus history
+make down                            # SIGINT everything
 ```
 
 Prefer to run a single component in the foreground (e.g. to watch server logs inline)? The existing `run-server`, `run-proxy`, `run-client`, `run-fleet` targets still work.
@@ -183,10 +183,10 @@ COUNT=25 PROFILE=flaky ./scripts/demo.sh
 - `make grafana`: start the docker-compose Prometheus + Grafana stack (`PROM_RETENTION=1d` default)
 - `make grafana-down`: stop the observability stack
 - `make grafana-logs` / `make grafana-status`: tail logs / show container status
-- `make stack-up`: start server + proxy (`PROFILE`) + fleet (`COUNT` × `ROLE`) in the background
-- `make stack-down`: stop the background workload stack
-- `make stack-restart`: stack-down, then stack-up (useful for swapping `PROFILE`)
-- `make stack-status` / `make stack-logs`: component state / `tail -F` over all three logs
+- `make up`: start server + proxy (`PROFILE`) + fleet (`COUNT` × `ROLE`) in the background
+- `make down`: stop the background workload
+- `make restart`: down, then up (useful for swapping `PROFILE`)
+- `make status` / `make logs`: component state / `tail -F` over all three logs
 
 ## Expected Behavior
 

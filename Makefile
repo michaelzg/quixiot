@@ -42,7 +42,7 @@ PROM_PORT ?= 9090
 GF_PORT ?= 3000
 PROM_RETENTION ?= 1d
 
-.PHONY: all build $(CMDS) test vet fmt tidy clean help certs run-server run-proxy run-client run-fleet demo verify metrics grafana grafana-down grafana-logs grafana-status observability observability-down stack-up stack-down stack-restart stack-status stack-logs stack-tail
+.PHONY: all build $(CMDS) test vet fmt tidy clean help certs run-server run-proxy run-client run-fleet demo verify metrics grafana grafana-down grafana-logs grafana-status observability observability-down up down restart status logs
 
 all: build
 
@@ -150,16 +150,16 @@ grafana-status:
 observability: grafana
 observability-down: grafana-down
 
-# --- QuixIoT workload stack (server + proxy + fleet) ---
+# --- QuixIoT workload (server + proxy + fleet, background) ---
 
 # Bring up the workload in the background: server, proxy on PROFILE, fleet
 # of COUNT x FLEET_ROLE. PIDs land in $(STACK_RUN_DIR); logs in $(STACK_LOG_DIR).
 # Pairs with `make grafana` — the Grafana dashboard renders live once both are up.
 # Overrides: PROFILE, COUNT, ROLE, LOG_LEVEL, SERVER_ADDR, PROXY_LISTEN, etc.
-stack-up: build certs
+up: build certs
 	@mkdir -p $(STACK_RUN_DIR) $(STACK_LOG_DIR) $(UPLOAD_DIR)
 	@if [ -f $(STACK_RUN_DIR)/server.pid ] && kill -0 $$(cat $(STACK_RUN_DIR)/server.pid) 2>/dev/null; then \
-		echo "stack-up: server already running (pid $$(cat $(STACK_RUN_DIR)/server.pid)); run 'make stack-down' first" >&2; \
+		echo "up: server already running (pid $$(cat $(STACK_RUN_DIR)/server.pid)); run 'make down' first" >&2; \
 		exit 1; \
 	fi
 	@rm -f $(STACK_RUN_DIR)/server.pid $(STACK_RUN_DIR)/proxy.pid $(STACK_RUN_DIR)/fleet.pid
@@ -192,22 +192,22 @@ stack-up: build certs
 		--log-level $(LOG_LEVEL) \
 		>$(STACK_LOG_DIR)/fleet.log 2>&1 & echo $$! > $(STACK_RUN_DIR)/fleet.pid
 	@sleep 2
-	@echo "stack up: profile=$(PROFILE) count=$(COUNT) role=$(FLEET_ROLE)"
+	@echo "up: profile=$(PROFILE) count=$(COUNT) role=$(FLEET_ROLE)"
 	@echo "  server pid: $$(cat $(STACK_RUN_DIR)/server.pid)   log: $(STACK_LOG_DIR)/server.log"
 	@echo "  proxy  pid: $$(cat $(STACK_RUN_DIR)/proxy.pid)   log: $(STACK_LOG_DIR)/proxy.log"
 	@echo "  fleet  pid: $$(cat $(STACK_RUN_DIR)/fleet.pid)   log: $(STACK_LOG_DIR)/fleet.log"
 	@echo "  grafana:    http://127.0.0.1:$(GF_PORT)/d/quixiot-overview  (run 'make grafana' first if needed)"
 
-# Stop the workload stack. Sends SIGINT for an orderly QUIC close. Also sweeps
+# Stop the workload. Sends SIGINT for an orderly QUIC close. Also sweeps
 # orphaned client children — the fleet SIGTERMs them on shutdown, but if the
 # user killed the fleet pid directly they can linger.
-stack-down:
+down:
 	@for name in fleet proxy server; do \
 		pidfile=$(STACK_RUN_DIR)/$$name.pid; \
 		if [ -f $$pidfile ]; then \
 			pid=$$(cat $$pidfile); \
 			if [ -n "$$pid" ] && kill -0 $$pid 2>/dev/null; then \
-				echo "stack-down: stopping $$name (pid $$pid)"; \
+				echo "down: stopping $$name (pid $$pid)"; \
 				kill -INT $$pid 2>/dev/null || true; \
 			fi; \
 			rm -f $$pidfile; \
@@ -216,11 +216,11 @@ stack-down:
 	@# Sweep any orphaned client children (best-effort, ignore 'no matches').
 	@pkill -INT -f '$(BIN)/client ' 2>/dev/null || true
 	@sleep 1
-	@echo "stack-down: done"
+	@echo "down: done"
 
-stack-restart: stack-down stack-up
+restart: down up
 
-stack-status:
+status:
 	@for name in server proxy fleet; do \
 		pidfile=$(STACK_RUN_DIR)/$$name.pid; \
 		if [ -f $$pidfile ] && kill -0 $$(cat $$pidfile) 2>/dev/null; then \
@@ -236,7 +236,7 @@ stack-status:
 	printf "  %-7s %s child(ren)\n" clients $$clients
 
 # Follow all three logs together. Ctrl-C to exit.
-stack-logs stack-tail:
+logs:
 	@tail -n 40 -F $(STACK_LOG_DIR)/server.log $(STACK_LOG_DIR)/proxy.log $(STACK_LOG_DIR)/fleet.log
 
 help:
@@ -259,8 +259,8 @@ help:
 	@echo "  grafana-down     stop the docker compose stack"
 	@echo "  grafana-logs     tail compose logs"
 	@echo "  grafana-status   show compose container status"
-	@echo "  stack-up         start server + proxy (PROFILE=$(PROFILE)) + fleet (COUNT=$(COUNT)) in background"
-	@echo "  stack-down       stop the background workload stack (SIGINT)"
-	@echo "  stack-restart    stack-down then stack-up"
-	@echo "  stack-status     show running/stopped state per component"
-	@echo "  stack-logs       tail -F server + proxy + fleet logs"
+	@echo "  up               start server + proxy (PROFILE=$(PROFILE)) + fleet (COUNT=$(COUNT)) in background"
+	@echo "  down             stop the background workload (SIGINT)"
+	@echo "  restart          down then up"
+	@echo "  status           show running/stopped state per component"
+	@echo "  logs             tail -F server + proxy + fleet logs"
