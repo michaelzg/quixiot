@@ -9,12 +9,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"quixiot/internal/config"
 	"quixiot/internal/logging"
@@ -26,22 +30,24 @@ import (
 const buildVersion = "dev"
 
 type serverConfig struct {
-	Addr      string `yaml:"addr"`
-	CertFile  string `yaml:"cert_file"`
-	KeyFile   string `yaml:"key_file"`
-	CAFile    string `yaml:"ca_file"`
-	UploadDir string `yaml:"upload_dir"`
-	LogLevel  string `yaml:"log_level"`
+	Addr            string `yaml:"addr"`
+	CertFile        string `yaml:"cert_file"`
+	KeyFile         string `yaml:"key_file"`
+	CAFile          string `yaml:"ca_file"`
+	UploadDir       string `yaml:"upload_dir"`
+	MetricsPlainAddr string `yaml:"metrics_plain_addr"`
+	LogLevel        string `yaml:"log_level"`
 }
 
 func defaults() serverConfig {
 	return serverConfig{
-		Addr:      ":4444",
-		CertFile:  "var/certs/server.pem",
-		KeyFile:   "var/certs/server.key",
-		CAFile:    "var/certs/ca.pem",
-		UploadDir: "var/uploads",
-		LogLevel:  "info",
+		Addr:            ":4444",
+		CertFile:        "var/certs/server.pem",
+		KeyFile:         "var/certs/server.key",
+		CAFile:          "var/certs/ca.pem",
+		UploadDir:       "var/uploads",
+		MetricsPlainAddr: "127.0.0.1:9103",
+		LogLevel:        "info",
 	}
 }
 
@@ -62,6 +68,7 @@ func run(args []string) error {
 	keyFile := fs.String("key-file", def.KeyFile, "server leaf private key PEM")
 	caFile := fs.String("ca-file", def.CAFile, "CA certificate PEM path")
 	uploadDir := fs.String("upload-dir", def.UploadDir, "sandboxed upload directory")
+	metricsPlainAddr := fs.String("metrics-plain-addr", def.MetricsPlainAddr, "Prometheus metrics listen address (plain HTTP, empty disables)")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
 
 	genCerts := fs.Bool("gen-certs", false, "generate local CA + server leaf into --cert-dir and exit")
@@ -90,6 +97,8 @@ func run(args []string) error {
 			cfg.CAFile = *caFile
 		case "upload-dir":
 			cfg.UploadDir = *uploadDir
+		case "metrics-plain-addr":
+			cfg.MetricsPlainAddr = *metricsPlainAddr
 		case "log-level":
 			cfg.LogLevel = *logLevel
 		}
@@ -129,13 +138,14 @@ func run(args []string) error {
 	}
 	defer pc.Close()
 
+	serverMetrics := metrics.NewServer()
 	srv, err := server.New(server.Options{
 		PacketConn: pc,
 		TLSConfig:  tlsConf,
 		Logger:     log,
 		Version:    buildVersion,
 		UploadDir:  cfg.UploadDir,
-		Metrics:    metrics.NewServer(),
+		Metrics:    serverMetrics,
 	})
 	if err != nil {
 		return err
@@ -145,13 +155,43 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if err := servePlainMetrics(ctx, cfg.MetricsPlainAddr, serverMetrics.Registry, log); err != nil {
+		return err
+	}
+
 	log.Info("server listening",
 		"addr", pc.LocalAddr().String(),
 		"cert_file", cfg.CertFile,
 		"key_file", cfg.KeyFile,
 		"upload_dir", cfg.UploadDir,
+		"metrics_plain_addr", cfg.MetricsPlainAddr,
 	)
 	return srv.Serve(ctx)
+}
+
+// servePlainMetrics exposes the same Prometheus registry over plain HTTP so
+// Prometheus (which doesn't speak HTTP/3) can scrape the server.
+func servePlainMetrics(ctx context.Context, addr string, reg *prometheus.Registry, log *slog.Logger) error {
+	if addr == "" {
+		return nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("server: listen plain metrics %q: %w", addr, err)
+	}
+	srv := &http.Server{Handler: metrics.Handler(reg)}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Error("server plain metrics endpoint failed", "addr", addr, "error", err)
+		}
+	}()
+	return nil
 }
 
 func splitSANs(s string) []string {

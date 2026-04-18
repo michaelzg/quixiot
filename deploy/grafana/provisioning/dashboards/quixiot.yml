@@ -1,0 +1,12 @@
+apiVersion: 1
+providers:
+  - name: quixiot
+    orgId: 1
+    folder: QuixIoT
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

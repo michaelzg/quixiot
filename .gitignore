@@ -18,6 +18,9 @@
 /proxy
 /fleet
 
+# Local build/test cache (used during sandboxed go runs)
+/.gocache/
+
 # Editor/OS junk
 .DS_Store
 .idea/
@@ -25,3 +28,9 @@
 *.swp
 *.swo
 *~
+
+# Compose / observability local state. The targets file is rewritten by the
+# fleet on every start, so we don't track per-run contents — the directory
+# stays via .gitkeep so the docker compose bind mount works on a fresh clone.
+/deploy/targets/clients.json
+/deploy/data/

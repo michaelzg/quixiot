@@ -1,0 +1,44 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+  external_labels:
+    deployment: quixiot-local
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: quixiot-server
+    static_configs:
+      - targets: ["host.docker.internal:9103"]
+        labels:
+          component: server
+
+  - job_name: quixiot-proxy
+    static_configs:
+      - targets: ["host.docker.internal:9104"]
+        labels:
+          component: proxy
+
+  # Standalone single client (e.g. `make run-client CLIENT_METRICS_ADDR=127.0.0.1:9105`).
+  - job_name: quixiot-client-standalone
+    static_configs:
+      - targets: ["host.docker.internal:9105"]
+        labels:
+          component: client
+          client_id: standalone
+
+  # Fleet writes deploy/targets/clients.json with one entry per child.
+  # Prometheus refreshes the file every 5s without a reload.
+  - job_name: quixiot-client-fleet
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/clients.json
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: component
+        replacement: client

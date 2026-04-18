@@ -1,0 +1,1 @@
+# Fleet writes clients.json here at startup for Prometheus file_sd discovery.
