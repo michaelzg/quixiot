@@ -94,20 +94,25 @@ make metrics
 
 A docker-compose stack ships Prometheus + Grafana with the QuixIoT dashboard pre-provisioned. Components run on the host (so they keep their HTTP/3 sockets) and Prometheus reaches them through `host.docker.internal`.
 
-Start the stack:
+Start the observability stack (containers):
 
 ```sh
 make grafana                    # default 1 day retention
 PROM_RETENTION=24h make grafana # override (e.g. 24h, 7d)
 ```
 
-Then run any combination of server / proxy / fleet on the host:
+Start the workload stack (quixiot binaries, background):
 
 ```sh
-make run-server &
-PROFILE=cellular-3g make run-proxy &
-COUNT=20 ROLE=mixed make run-fleet
+make stack-up                              # server + cellular-3g proxy + 10 mixed clients
+PROFILE=flaky COUNT=20 make stack-up       # override profile / size
+make stack-status                          # RUNNING / stopped per component
+make stack-logs                            # tail -F server + proxy + fleet
+make stack-restart PROFILE=satellite       # swap profiles without losing Prometheus history
+make stack-down                            # SIGINT everything
 ```
+
+Prefer to run a single component in the foreground (e.g. to watch server logs inline)? The existing `run-server`, `run-proxy`, `run-client`, `run-fleet` targets still work.
 
 Open Grafana at <http://127.0.0.1:3000/d/quixiot-overview> (admin / admin; anonymous viewer is also enabled). The dashboard has six rows:
 
@@ -176,8 +181,12 @@ COUNT=25 PROFILE=flaky ./scripts/demo.sh
 - `make verify`: run `scripts/verify.sh`
 - `make demo`: run `scripts/demo.sh`
 - `make grafana`: start the docker-compose Prometheus + Grafana stack (`PROM_RETENTION=1d` default)
-- `make grafana-down`: stop the stack
+- `make grafana-down`: stop the observability stack
 - `make grafana-logs` / `make grafana-status`: tail logs / show container status
+- `make stack-up`: start server + proxy (`PROFILE`) + fleet (`COUNT` × `ROLE`) in the background
+- `make stack-down`: stop the background workload stack
+- `make stack-restart`: stack-down, then stack-up (useful for swapping `PROFILE`)
+- `make stack-status` / `make stack-logs`: component state / `tail -F` over all three logs
 
 ## Expected Behavior
 

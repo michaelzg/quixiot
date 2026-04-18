@@ -23,8 +23,14 @@ PROFILE ?= passthrough
 LOG_LEVEL ?= info
 
 FLEET_METRICS_PORT_BASE ?= 9200
-FLEET_METRICS_HOST ?= 127.0.0.1
+# Advertised host for per-child metrics in deploy/targets/clients.json.
+# host.docker.internal lets a dockerized Prometheus (see `make grafana`)
+# reach the fleet on the host. Override to 127.0.0.1 for host-only scraping.
+FLEET_METRICS_HOST ?= host.docker.internal
 FLEET_TARGETS_FILE ?= deploy/targets/clients.json
+
+STACK_RUN_DIR ?= var/run
+STACK_LOG_DIR ?= var/logs
 
 CLIENT_ROLE = $(or $(ROLE),poller)
 FLEET_ROLE = $(or $(ROLE),mixed)
@@ -36,7 +42,7 @@ PROM_PORT ?= 9090
 GF_PORT ?= 3000
 PROM_RETENTION ?= 1d
 
-.PHONY: all build $(CMDS) test vet fmt tidy clean help certs run-server run-proxy run-client run-fleet demo verify metrics grafana grafana-down grafana-logs grafana-status observability observability-down
+.PHONY: all build $(CMDS) test vet fmt tidy clean help certs run-server run-proxy run-client run-fleet demo verify metrics grafana grafana-down grafana-logs grafana-status observability observability-down stack-up stack-down stack-restart stack-status stack-logs stack-tail
 
 all: build
 
@@ -144,6 +150,95 @@ grafana-status:
 observability: grafana
 observability-down: grafana-down
 
+# --- QuixIoT workload stack (server + proxy + fleet) ---
+
+# Bring up the workload in the background: server, proxy on PROFILE, fleet
+# of COUNT x FLEET_ROLE. PIDs land in $(STACK_RUN_DIR); logs in $(STACK_LOG_DIR).
+# Pairs with `make grafana` — the Grafana dashboard renders live once both are up.
+# Overrides: PROFILE, COUNT, ROLE, LOG_LEVEL, SERVER_ADDR, PROXY_LISTEN, etc.
+stack-up: build certs
+	@mkdir -p $(STACK_RUN_DIR) $(STACK_LOG_DIR) $(UPLOAD_DIR)
+	@if [ -f $(STACK_RUN_DIR)/server.pid ] && kill -0 $$(cat $(STACK_RUN_DIR)/server.pid) 2>/dev/null; then \
+		echo "stack-up: server already running (pid $$(cat $(STACK_RUN_DIR)/server.pid)); run 'make stack-down' first" >&2; \
+		exit 1; \
+	fi
+	@rm -f $(STACK_RUN_DIR)/server.pid $(STACK_RUN_DIR)/proxy.pid $(STACK_RUN_DIR)/fleet.pid
+	@$(BIN)/server \
+		--addr $(SERVER_ADDR) \
+		--cert-file $(CERT_FILE) \
+		--key-file $(KEY_FILE) \
+		--upload-dir $(UPLOAD_DIR) \
+		--metrics-plain-addr $(SERVER_METRICS_PLAIN_ADDR) \
+		--log-level $(LOG_LEVEL) \
+		>$(STACK_LOG_DIR)/server.log 2>&1 & echo $$! > $(STACK_RUN_DIR)/server.pid
+	@sleep 1
+	@$(BIN)/proxy \
+		--listen $(PROXY_LISTEN) \
+		--upstream $(PROXY_UPSTREAM) \
+		--profile $(PROFILE) \
+		--metrics-addr $(PROXY_METRICS_ADDR) \
+		--log-level $(LOG_LEVEL) \
+		>$(STACK_LOG_DIR)/proxy.log 2>&1 & echo $$! > $(STACK_RUN_DIR)/proxy.pid
+	@sleep 1
+	@$(BIN)/fleet \
+		--client-bin $(BIN)/client \
+		--server-url $(SERVER_URL) \
+		--ca-file $(CA_FILE) \
+		--count $(COUNT) \
+		--role $(FLEET_ROLE) \
+		--metrics-port-base $(FLEET_METRICS_PORT_BASE) \
+		--metrics-host $(FLEET_METRICS_HOST) \
+		--targets-file $(FLEET_TARGETS_FILE) \
+		--log-level $(LOG_LEVEL) \
+		>$(STACK_LOG_DIR)/fleet.log 2>&1 & echo $$! > $(STACK_RUN_DIR)/fleet.pid
+	@sleep 2
+	@echo "stack up: profile=$(PROFILE) count=$(COUNT) role=$(FLEET_ROLE)"
+	@echo "  server pid: $$(cat $(STACK_RUN_DIR)/server.pid)   log: $(STACK_LOG_DIR)/server.log"
+	@echo "  proxy  pid: $$(cat $(STACK_RUN_DIR)/proxy.pid)   log: $(STACK_LOG_DIR)/proxy.log"
+	@echo "  fleet  pid: $$(cat $(STACK_RUN_DIR)/fleet.pid)   log: $(STACK_LOG_DIR)/fleet.log"
+	@echo "  grafana:    http://127.0.0.1:$(GF_PORT)/d/quixiot-overview  (run 'make grafana' first if needed)"
+
+# Stop the workload stack. Sends SIGINT for an orderly QUIC close. Also sweeps
+# orphaned client children — the fleet SIGTERMs them on shutdown, but if the
+# user killed the fleet pid directly they can linger.
+stack-down:
+	@for name in fleet proxy server; do \
+		pidfile=$(STACK_RUN_DIR)/$$name.pid; \
+		if [ -f $$pidfile ]; then \
+			pid=$$(cat $$pidfile); \
+			if [ -n "$$pid" ] && kill -0 $$pid 2>/dev/null; then \
+				echo "stack-down: stopping $$name (pid $$pid)"; \
+				kill -INT $$pid 2>/dev/null || true; \
+			fi; \
+			rm -f $$pidfile; \
+		fi; \
+	done
+	@# Sweep any orphaned client children (best-effort, ignore 'no matches').
+	@pkill -INT -f '$(BIN)/client ' 2>/dev/null || true
+	@sleep 1
+	@echo "stack-down: done"
+
+stack-restart: stack-down stack-up
+
+stack-status:
+	@for name in server proxy fleet; do \
+		pidfile=$(STACK_RUN_DIR)/$$name.pid; \
+		if [ -f $$pidfile ] && kill -0 $$(cat $$pidfile) 2>/dev/null; then \
+			printf "  %-7s RUNNING   pid=%s\n" $$name $$(cat $$pidfile); \
+		else \
+			printf "  %-7s stopped\n" $$name; \
+		fi; \
+	done
+	@fleetpid=$$(cat $(STACK_RUN_DIR)/fleet.pid 2>/dev/null); \
+	if [ -n "$$fleetpid" ]; then \
+		clients=$$(pgrep -P $$fleetpid 2>/dev/null | wc -l | tr -d ' '); \
+	else clients=0; fi; \
+	printf "  %-7s %s child(ren)\n" clients $$clients
+
+# Follow all three logs together. Ctrl-C to exit.
+stack-logs stack-tail:
+	@tail -n 40 -F $(STACK_LOG_DIR)/server.log $(STACK_LOG_DIR)/proxy.log $(STACK_LOG_DIR)/fleet.log
+
 help:
 	@echo "Targets:"
 	@echo "  build            build all cmd binaries into $(BIN)/"
@@ -164,3 +259,8 @@ help:
 	@echo "  grafana-down     stop the docker compose stack"
 	@echo "  grafana-logs     tail compose logs"
 	@echo "  grafana-status   show compose container status"
+	@echo "  stack-up         start server + proxy (PROFILE=$(PROFILE)) + fleet (COUNT=$(COUNT)) in background"
+	@echo "  stack-down       stop the background workload stack (SIGINT)"
+	@echo "  stack-restart    stack-down then stack-up"
+	@echo "  stack-status     show running/stopped state per component"
+	@echo "  stack-logs       tail -F server + proxy + fleet logs"
