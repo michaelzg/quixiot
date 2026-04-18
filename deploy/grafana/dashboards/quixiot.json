@@ -706,19 +706,63 @@
         "legend": {"show": true}
       }
     },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Client-measured poll duration p50/p95/p99",
+      "description": "How long a single poll (`GET /state` or `GET /config/{id}`) took, **measured from the client side** — so it includes the network round-trip, not just server handler time. Compare with *Server request latency* above: the delta is roughly the RTT plus any queuing in the proxy. Under `satellite` (~600 ms RTT) the gap is obvious.",
+      "gridPos": {"x": 0, "y": 83, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(quixiot_client_poll_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))", "legendFormat": "p50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(quixiot_client_poll_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))", "legendFormat": "p95"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(quixiot_client_poll_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 1.5, "fillOpacity": 0, "showPoints": "never"}
+        }
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Client-measured upload duration p50/p95/p99",
+      "description": "Total time each upload took, **measured at the client** from request issue to server response received. This includes request upload, server write + SHA-256, and response download. Compare with the server-side *Upload duration distribution*: the gap is network transfer time — most dramatic on `satellite` (high RTT) and `flaky` (loss-driven retransmissions).",
+      "gridPos": {"x": 12, "y": 83, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(quixiot_client_upload_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))", "legendFormat": "p50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(quixiot_client_upload_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))", "legendFormat": "p95"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(quixiot_client_upload_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 1.5, "fillOpacity": 0, "showPoints": "never"}
+        }
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
 
     {
       "id": 600,
       "type": "row",
       "title": "Proxy internals (advanced)",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 83, "w": 24, "h": 1}
+      "gridPos": {"x": 0, "y": 89, "w": 24, "h": 1}
     },
     {
       "id": 1060,
       "type": "text",
       "title": "",
-      "gridPos": {"x": 0, "y": 84, "w": 24, "h": 2},
+      "gridPos": {"x": 0, "y": 90, "w": 24, "h": 2},
       "options": {
         "mode": "markdown",
         "content": "Deeper diagnostics for the impairment proxy — raw byte rates, session lifecycle, and enforced-delay percentiles. Mostly useful when sanity-checking that the proxy is actually doing what the active profile says it should."
@@ -729,7 +773,7 @@
       "type": "timeseries",
       "title": "Bytes/sec by direction",
       "description": "Raw UDP bytes/sec through the proxy, per direction. Uploads dominate `to_server`; pubsub delivery and poll responses dominate `to_client`.",
-      "gridPos": {"x": 0, "y": 86, "w": 8, "h": 6},
+      "gridPos": {"x": 0, "y": 92, "w": 8, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -751,7 +795,7 @@
       "type": "timeseries",
       "title": "Sessions over time (active / cumulative)",
       "description": "- **active** (left axis) — proxy NAT entries currently open (gauge). Plateaus at the fleet size.\n- **total (cumulative)** (right axis) — every session the proxy has ever tracked in this run (counter). Grows by one per new client; should be flat once the fleet is fully up. If it keeps climbing, NAT entries are cycling (which usually means reconnects).\n\nThe two series are on separate Y-axes so the cumulative counter doesn't dwarf the active gauge.",
-      "gridPos": {"x": 8, "y": 86, "w": 8, "h": 6},
+      "gridPos": {"x": 8, "y": 92, "w": 8, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "quixiot_proxy_sessions_active", "legendFormat": "active"},
@@ -788,7 +832,7 @@
       "type": "timeseries",
       "title": "Enforced delay p50/p95/p99",
       "description": "Percentiles of the latency the proxy adds per packet, split by direction. p50 is near `latency`; p99 is near `latency + jitter`.",
-      "gridPos": {"x": 16, "y": 86, "w": 8, "h": 6},
+      "gridPos": {"x": 16, "y": 92, "w": 8, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le, direction) (rate(quixiot_proxy_enforced_delay_seconds_bucket{direction=~\"$direction\"}[$__rate_interval])))", "legendFormat": "p50 {{direction}}"},
@@ -811,13 +855,13 @@
       "type": "row",
       "title": "Glossary",
       "collapsed": true,
-      "gridPos": {"x": 0, "y": 92, "w": 24, "h": 1},
+      "gridPos": {"x": 0, "y": 98, "w": 24, "h": 1},
       "panels": [
         {
           "id": 1070,
           "type": "text",
           "title": "",
-          "gridPos": {"x": 0, "y": 93, "w": 24, "h": 14},
+          "gridPos": {"x": 0, "y": 99, "w": 24, "h": 14},
           "options": {
             "mode": "markdown",
             "content": "### Glossary\n\n- **QUIC** — Transport protocol used by HTTP/3. Runs on UDP. Identifies each connection with a Connection ID (not an IP:port tuple), which is why it survives path changes like phone ↔ wifi.\n- **HTTP/3** — HTTP semantics running over QUIC. Plain request/response, same as HTTP/2 — different transport.\n- **WebTransport** — An API on top of HTTP/3 that exposes many bidirectional streams plus **datagrams** on one QUIC connection. Cheaper than opening separate connections per stream.\n- **Stream** — A reliable, in-order byte pipe within a QUIC connection. Loss on a stream is retransmitted. Multiple streams on one connection don't block each other (no head-of-line blocking between streams).\n- **Datagram** — An unreliable, unordered, length-delimited message within a QUIC connection. Lost datagrams are **not** retransmitted. Tradeoff: lower latency, no backpressure.\n- **RTT (round-trip time)** — Time from sending a packet to getting an ACK back. QUIC completes its handshake in 1 RTT (vs 2-3 for TLS-over-TCP).\n- **Handshake** — The initial key-exchange dance. Expensive (TLS + QUIC state). Reused on reconnects.\n- **Keepalive** — Small periodic packet sent by the client to prevent idle timeout on the connection. Client-side setting `KeepAlivePeriod` (15s here).\n- **Reconnect** — The event a client logs when it has to tear down its QUIC connection and redo the handshake. **In this PoC, reconnects should stay at 0** through every profile.\n- **Impairment profile** — YAML file in `configs/` describing the simulated network. Each profile has separate `to_server` and `to_client` settings for `drop_probability`, `latency`, `jitter`, and `bandwidth_bps`.\n- **NAT session** — One logical client↔server flow in the proxy, keyed by the client's source `ip:port`. Evicted after 5 minutes idle.\n- **Surface** (pubsub) — Which QUIC-level transport carried the message: `datagram` (unreliable) or `stream` (reliable).\n- **Direction** — `to_server` = uplink (client → server); `to_client` = downlink (server → client)."
