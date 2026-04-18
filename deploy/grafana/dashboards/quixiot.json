@@ -498,8 +498,8 @@
     {
       "id": 31,
       "type": "timeseries",
-      "title": "Datagram round-trip loss % by topic",
-      "description": "Computed: `(out − in) / out` across all selected clients. Treats the fleet as one broadcast domain: if any publisher sends `N` datagrams on a topic, subscribers should collectively receive `N × subscribers`. This ratio is the headline contrast vs reliable streams — expect near-zero on `wifi-good`, visible gaps on `flaky`.",
+      "title": "Datagram delivery loss % by topic",
+      "description": "**One-way** delivery loss, not round-trip. Computed: `(out − in) / out` across all selected clients — how many published datagrams failed to reach subscribers. Treats the fleet as one broadcast domain: if any publisher sends `N` datagrams on a topic, subscribers should collectively receive `N × subscribers`. Expect near-zero on `wifi-good`, visible gaps on `flaky`. This is the headline contrast vs reliable streams, whose loss is always 0 (retransmitted).",
       "gridPos": {"x": 12, "y": 51, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
@@ -626,8 +626,8 @@
     {
       "id": 42,
       "type": "timeseries",
-      "title": "Upload bytes/sec",
-      "description": "Payload bytes/sec **handed to the server's upload handler**, from `quixiot_server_upload_bytes`. This is application-layer data, not raw wire bytes (for wire bytes see *Bytes/sec by direction* in the proxy row). Shape: steep ramps during each upload, flat between.",
+      "title": "Upload payload bytes/sec (application-layer)",
+      "description": "Payload bytes/sec **handed to the server's upload handler**, from `quixiot_server_upload_bytes`. This is application-layer data — smaller than what crosses the wire (QUIC + HTTP/3 framing, plus retransmissions). For raw wire bytes see *Bytes/sec by direction* in the proxy row. Shape: steep ramps during each upload, flat between.",
       "gridPos": {"x": 0, "y": 77, "w": 12, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
@@ -709,8 +709,8 @@
     {
       "id": 51,
       "type": "timeseries",
-      "title": "Sessions over time",
-      "description": "- **active** — proxy NAT entries currently open (gauge)\n- **total (cumulative)** — every session the proxy has ever tracked in this run (counter)\n\nIn a steady fleet the two diverge: active plateaus at the fleet size; total keeps rising only if clients disconnect/reconnect (which they shouldn't — if total keeps climbing, something's cycling NAT entries).",
+      "title": "Sessions over time (active / cumulative)",
+      "description": "- **active** (left axis) — proxy NAT entries currently open (gauge). Plateaus at the fleet size.\n- **total (cumulative)** (right axis) — every session the proxy has ever tracked in this run (counter). Grows by one per new client; should be flat once the fleet is fully up. If it keeps climbing, NAT entries are cycling (which usually means reconnects).\n\nThe two series are on separate Y-axes so the cumulative counter doesn't dwarf the active gauge.",
       "gridPos": {"x": 8, "y": 86, "w": 8, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
@@ -723,7 +723,23 @@
           "min": 0,
           "color": {"mode": "palette-classic"},
           "custom": {"drawStyle": "line", "lineWidth": 1.5, "fillOpacity": 0, "showPoints": "never"}
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "total (cumulative)"},
+            "properties": [
+              {"id": "custom.axisPlacement", "value": "right"},
+              {"id": "custom.axisLabel", "value": "cumulative"},
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "active"},
+            "properties": [
+              {"id": "custom.axisLabel", "value": "active"}
+            ]
+          }
+        ]
       },
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
     },
