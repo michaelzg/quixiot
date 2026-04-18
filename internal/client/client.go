@@ -13,10 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 
 	"quixiot/internal/metrics"
 	"quixiot/internal/tlsutil"
@@ -40,11 +40,15 @@ type Options struct {
 
 type Client struct {
 	baseURL    string
+	authority  string
 	httpClient *http.Client
-	transport  *http3.Transport
 	tlsConfig  *tls.Config
 	metrics    *metrics.ClientMetrics
 	logger     *slog.Logger
+
+	sharedMu sync.Mutex
+	shared   *sharedConn
+	closed   bool
 }
 
 type State struct {
@@ -79,6 +83,10 @@ func New(opts Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("client: parse normalized base URL %q: %w", baseURL, err)
+	}
 	tlsConf, err := tlsutil.LoadClientTrust(opts.CAFile)
 	if err != nil {
 		return nil, err
@@ -91,19 +99,12 @@ func New(opts Options) (*Client, error) {
 
 	c := &Client{
 		baseURL:   baseURL,
+		authority: u.Host,
 		tlsConfig: tlsConf,
 		metrics:   opts.Metrics,
 		logger:    log,
 	}
-	transport := &http3.Transport{
-		TLSClientConfig: tlsConf,
-		QUICConfig:      quicConfig(),
-		EnableDatagrams: true,
-		Logger:          log,
-		Dial:            c.dialQUIC,
-	}
-	c.httpClient = &http.Client{Transport: transport}
-	c.transport = transport
+	c.httpClient = &http.Client{Transport: clientRoundTripper{client: c}}
 	return c, nil
 }
 
@@ -175,10 +176,16 @@ func (c *Client) UploadDeterministic(ctx context.Context, name string, size int6
 }
 
 func (c *Client) Close() error {
-	if c.transport == nil {
+	c.sharedMu.Lock()
+	c.closed = true
+	shared := c.shared
+	c.shared = nil
+	c.sharedMu.Unlock()
+
+	if shared == nil {
 		return nil
 	}
-	return c.transport.Close()
+	return shared.close()
 }
 
 func quicConfig() *quic.Config {

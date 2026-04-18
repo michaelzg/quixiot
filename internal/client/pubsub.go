@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
-	"github.com/quic-go/webtransport-go"
+	"github.com/quic-go/quic-go"
 
 	"quixiot/internal/metrics"
 	"quixiot/internal/wire"
@@ -36,8 +35,8 @@ type PubSubMessage struct {
 }
 
 type PubSubSession struct {
-	session *webtransport.Session
-	control *webtransport.Stream
+	session pubsubTransportSession
+	control *quic.Stream
 	logger  *slog.Logger
 	metrics *metrics.ClientMetrics
 
@@ -53,21 +52,7 @@ func (c *Client) ConnectPubSub(ctx context.Context, clientID string) (*PubSubSes
 		return nil, fmt.Errorf("client: client ID is required")
 	}
 
-	tlsConf := c.tlsConfig.Clone()
-	if tlsConf == nil {
-		return nil, fmt.Errorf("client: missing TLS config")
-	}
-
-	dialer := &webtransport.Dialer{
-		TLSClientConfig:      tlsConf,
-		QUICConfig:           quicConfig(),
-		ApplicationProtocols: []string{pubsubProtocol},
-		DialAddr:             c.dialQUIC,
-	}
-
-	hdr := make(http.Header)
-	hdr.Set(clientIDHeader, clientID)
-	resp, sess, err := dialer.Dial(ctx, c.baseURL+"/pubsub", hdr)
+	sess, resp, err := c.connectPubSubTransport(ctx, clientID)
 	if err != nil {
 		return nil, fmt.Errorf("client: dial pubsub: %w", err)
 	}
@@ -77,7 +62,7 @@ func (c *Client) ConnectPubSub(ctx context.Context, clientID string) (*PubSubSes
 
 	control, err := sess.OpenStreamSync(ctx)
 	if err != nil {
-		_ = sess.CloseWithError(0, "")
+		_ = sess.Close()
 		return nil, fmt.Errorf("client: open control stream: %w", err)
 	}
 
@@ -148,7 +133,7 @@ func (p *PubSubSession) Close() error {
 			}
 		}
 		if p.session != nil {
-			if err := p.session.CloseWithError(0, ""); err != nil && closeErr == nil {
+			if err := p.session.Close(); err != nil && closeErr == nil {
 				closeErr = err
 			}
 		}
@@ -206,7 +191,7 @@ func (p *PubSubSession) readUniStreams() {
 	}
 }
 
-func (p *PubSubSession) readUniStream(str *webtransport.ReceiveStream) {
+func (p *PubSubSession) readUniStream(str *quic.ReceiveStream) {
 	for {
 		frame, err := wire.ReadStreamFrame(str)
 		if err != nil {

@@ -2,17 +2,14 @@ package server_test
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/http3"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"quixiot/internal/client"
 	"quixiot/internal/metrics"
@@ -20,7 +17,92 @@ import (
 	"quixiot/internal/tlsutil"
 )
 
+func TestClientReusesSingleQUICConnectionAcrossHTTPAndPubSub(t *testing.T) {
+	serverMetrics := metrics.NewServer()
+	_, baseURL, caFile := startMetricsServer(t, serverMetrics)
+
+	c, err := client.New(client.Options{
+		BaseURL: baseURL,
+		CAFile:  caFile,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	waitForServerReady(t, c)
+
+	if _, err := c.GetConfig(context.Background(), "device-123"); err != nil {
+		t.Fatalf("GetConfig: %v", err)
+	}
+	if _, err := c.UploadDeterministic(context.Background(), "device-123-000.bin", 1024, 7); err != nil {
+		t.Fatalf("UploadDeterministic: %v", err)
+	}
+
+	sub, err := c.ConnectPubSub(context.Background(), "device-123-sub")
+	if err != nil {
+		t.Fatalf("ConnectPubSub subscriber: %v", err)
+	}
+	defer sub.Close()
+
+	pub, err := c.ConnectPubSub(context.Background(), "device-123-pub")
+	if err != nil {
+		t.Fatalf("ConnectPubSub publisher: %v", err)
+	}
+	defer pub.Close()
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return testutil.ToFloat64(serverMetrics.ConnectionsTotal) == 1 &&
+			testutil.ToFloat64(serverMetrics.ConnectionsActive) == 1
+	}, "client never converged to a single shared QUIC connection")
+}
+
 func TestServerMetricsReachHundredConcurrentConnections(t *testing.T) {
+	serverMetrics := metrics.NewServer()
+	_, baseURL, caFile := startMetricsServer(t, serverMetrics)
+
+	clients := make([]*client.Client, 0, 100)
+	sessions := make([]*client.PubSubSession, 0, 100)
+	t.Cleanup(func() {
+		for _, session := range sessions {
+			_ = session.Close()
+		}
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	})
+
+	for i := 0; i < 100; i++ {
+		c, err := client.New(client.Options{
+			BaseURL: baseURL,
+			CAFile:  caFile,
+			Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err != nil {
+			t.Fatalf("client.New %d: %v", i, err)
+		}
+		clients = append(clients, c)
+	}
+
+	waitForServerReady(t, clients[0])
+
+	for i, c := range clients {
+		session, err := c.ConnectPubSub(context.Background(), "fleet-"+strconv.Itoa(i))
+		if err != nil {
+			t.Fatalf("ConnectPubSub %d: %v", i, err)
+		}
+		sessions = append(sessions, session)
+	}
+
+	waitForCondition(t, 10*time.Second, func() bool {
+		return testutil.ToFloat64(serverMetrics.ConnectionsActive) >= 100
+	}, "active connections metric never reached 100")
+}
+
+func startMetricsServer(t *testing.T, serverMetrics *metrics.ServerMetrics) (*server.Server, string, string) {
+	t.Helper()
+
 	dir := t.TempDir()
 	paths, err := tlsutil.GenerateLocal(dir, []string{"127.0.0.1", "localhost", "::1"}, 24*time.Hour)
 	if err != nil {
@@ -43,14 +125,13 @@ func TestServerMetricsReachHundredConcurrentConnections(t *testing.T) {
 		Version:    "metrics-test",
 		StartedAt:  time.Now().UTC(),
 		UploadDir:  t.TempDir(),
-		Metrics:    metrics.NewServer(),
+		Metrics:    serverMetrics,
 	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("server.New: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.Serve(ctx)
@@ -62,103 +143,38 @@ func TestServerMetricsReachHundredConcurrentConnections(t *testing.T) {
 		}
 	})
 
-	baseURL := "https://" + pc.LocalAddr().String()
-	pubsubClient, err := client.New(client.Options{
-		BaseURL: baseURL,
-		CAFile:  paths.CA,
-		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
-	if err != nil {
-		t.Fatalf("client.New: %v", err)
-	}
-	t.Cleanup(func() { _ = pubsubClient.Close() })
+	return srv, "https://" + pc.LocalAddr().String(), paths.CA
+}
 
-	readyDeadline := time.Now().Add(3 * time.Second)
+func waitForServerReady(t *testing.T, c *client.Client) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
 	var readyErr error
 	for {
-		if _, err := pubsubClient.GetState(context.Background()); err == nil {
-			break
+		if _, err := c.GetState(context.Background()); err == nil {
+			return
 		} else {
 			readyErr = err
 		}
-		if time.Now().After(readyDeadline) {
+		if time.Now().After(deadline) {
 			t.Fatalf("server did not become ready: %v", readyErr)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-
-	sessions := make([]*client.PubSubSession, 0, 100)
-	for i := 0; i < 100; i++ {
-		session, err := pubsubClient.ConnectPubSub(context.Background(), "fleet-"+strconv.Itoa(i))
-		if err != nil {
-			t.Fatalf("ConnectPubSub %d: %v", i, err)
-		}
-		sessions = append(sessions, session)
-	}
-	t.Cleanup(func() {
-		for _, session := range sessions {
-			_ = session.Close()
-		}
-	})
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		body, err := fetchHTTP3(t, baseURL+"/metrics", paths.CA)
-		if err == nil {
-			active, ok := metricValue(body, "quixiot_server_connections_active")
-			if ok && active >= 100 {
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			if err != nil {
-				t.Fatalf("fetch metrics: %v", err)
-			}
-			t.Fatalf("active connections metric never reached 100")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 }
 
-func fetchHTTP3(t *testing.T, rawURL string, caFile string) (string, error) {
+func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, failure string) {
 	t.Helper()
 
-	tlsConf, err := tlsutil.LoadClientTrust(caFile)
-	if err != nil {
-		return "", err
-	}
-	transport := &http3.Transport{
-		TLSClientConfig: tlsConf,
-	}
-	defer transport.Close()
-
-	httpClient := &http.Client{Transport: transport}
-	resp, err := httpClient.Get(rawURL)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %s", resp.Status)
-	}
-	return string(body), nil
-}
-
-func metricValue(body string, name string) (float64, bool) {
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(line, name+" ") {
-			continue
+	deadline := time.Now().Add(timeout)
+	for {
+		if fn() {
+			return
 		}
-		value, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, name)), 64)
-		if err != nil {
-			return 0, false
+		if time.Now().After(deadline) {
+			t.Fatal(failure)
 		}
-		return value, true
+		time.Sleep(50 * time.Millisecond)
 	}
-	return 0, false
 }

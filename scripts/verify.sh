@@ -65,9 +65,15 @@ profile_drop_probability() {
 	local section="$2"
 	local config_file="configs/proxy-$profile.yaml"
 	awk -v section="$section" '
-	$1 == section ":" { in_section=1; next }
-	$1 ~ /^[A-Za-z0-9_-]+:/ && $1 != section ":" { in_section=0 }
-	in_section && $1 == "drop_probability:" { print $2; exit }
+	$0 ~ "^[[:space:]]*" section ":[[:space:]]*$" { in_section=1; next }
+	in_section && $0 ~ "^[^[:space:]][^:]*:[[:space:]]*" { in_section=0 }
+	in_section && $0 ~ "^[[:space:]]+drop_probability:[[:space:]]*" {
+		line = $0
+		sub(/^[[:space:]]+drop_probability:[[:space:]]*/, "", line)
+		sub(/[[:space:]]*(#.*)?$/, "", line)
+		print line
+		exit
+	}
 	' "$config_file"
 }
 
