@@ -47,13 +47,14 @@
       {
         "name": "client_id",
         "label": "Client",
+        "description": "Pick one client to avoid 10+ overlapping series. Set to All to see the whole fleet.",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(up{component=\"client\"}, client_id)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
-        "current": {"text": "All", "value": "$__all"}
+        "current": {"text": "fleet-000", "value": "fleet-000"}
       },
       {
         "name": "topic",
@@ -196,11 +197,11 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Reconnects (5m rate)",
-      "description": "Rate at which clients have had to tear down their QUIC connection and redo the handshake. This is the headline QUIC-resilience number: it should stay at 0 even on `flaky` (15% loss). Anything above zero means the connection broke and had to be rebuilt.",
+      "title": "Reconnects (1m rate)",
+      "description": "Rate at which clients have had to tear down their QUIC connection and redo the handshake, averaged over the last minute. This is the headline QUIC-resilience number: it should stay at 0 even on `flaky` (15% loss). Anything above zero means the connection broke and had to be rebuilt.",
       "gridPos": {"x": 12, "y": 8, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [{"refId": "A", "expr": "sum(rate(quixiot_client_reconnects_total[5m]))"}],
+      "targets": [{"refId": "A", "expr": "sum(rate(quixiot_client_reconnects_total[1m]))"}],
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -308,7 +309,7 @@
       "id": 10,
       "type": "timeseries",
       "title": "Drop rate by direction",
-      "description": "Observed packet-drop rate, split by direction:\n- `to_server` = uplink (client → server)\n- `to_client` = downlink (server → client)\n\nCompare with the profile's configured `drop_probability`: the live value naturally fluctuates around it.",
+      "description": "Observed packet-drop rate, split by direction:\n- `to_server` = uplink (client → server)\n- `to_client` = downlink (server → client)\n\nCompare with the profile's configured `drop_probability` (shown as reference lines): the live value naturally fluctuates around it. Threshold bands: green < 1%, yellow 1–5%, orange 5–10%, red > 10%.",
       "gridPos": {"x": 0, "y": 22, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
@@ -321,7 +322,23 @@
           "unit": "percent",
           "min": 0,
           "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 12, "gradientMode": "opacity", "showPoints": "never"}
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "orange", "value": 5},
+              {"color": "red", "value": 10}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "dashed"}
+          }
         }
       },
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
@@ -499,18 +516,18 @@
     {
       "id": 24,
       "type": "stat",
-      "title": "Median handshake (s)",
-      "description": "Median time to complete the QUIC+TLS handshake, computed from the histogram. Because QUIC finishes the handshake in 1 RTT (vs 2-3 for TLS-over-TCP), this value is close to the active profile's RTT.",
+      "title": "Median handshake (ms)",
+      "description": "Median time to complete the QUIC+TLS handshake, computed from the histogram. Because QUIC finishes the handshake in 1 RTT (vs 2-3 for TLS-over-TCP), this value tracks the active profile's RTT. For example on `cellular-3g` (~180 ms RTT) expect ~200 ms; on `satellite` (~1200 ms RTT) expect ~1200 ms.",
       "gridPos": {"x": 18, "y": 48, "w": 6, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
-        "expr": "histogram_quantile(0.5, sum by (le) (rate(quixiot_client_handshake_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))"
+        "expr": "1000 * histogram_quantile(0.5, sum by (le) (rate(quixiot_client_handshake_duration_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))"
       }],
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
-          "decimals": 3,
+          "unit": "ms",
+          "decimals": 0,
           "color": {"mode": "thresholds"},
           "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
         }
