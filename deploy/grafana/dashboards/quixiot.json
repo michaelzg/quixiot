@@ -4,7 +4,7 @@
   "tags": ["quixiot", "quic", "http3", "webtransport"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 1,
   "refresh": "5s",
@@ -69,18 +69,39 @@
   },
   "panels": [
     {
+      "id": 1000,
+      "type": "text",
+      "title": "",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 5},
+      "options": {
+        "mode": "markdown",
+        "content": "## What this dashboard shows\n\nA Go IoT client fleet talks to a server over **one QUIC connection per client**, through an intermediate proxy that injects packet loss, latency, jitter, duplicates, reorders, and bandwidth limits. Each connection carries three simultaneous workloads:\n\n- **Real-time messages (pubsub)** — WebTransport datagrams (unreliable) + streams (reliable)\n- **File uploads** — streaming HTTP/3 POST with SHA-256 verification\n- **State polling** — plain HTTP/3 GET on a ticker\n\nThe proxy is switched between five impairment profiles: `wifi-good`, `cellular-lte`, `cellular-3g`, `satellite`, `flaky` (15% loss). The headline question the dashboard answers: **does one QUIC connection survive every profile without tearing down and reconnecting?** (spoiler — yes; watch `Reconnects` stay at 0)."
+      }
+    },
+
+    {
       "id": 100,
       "type": "row",
       "title": "At a glance",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}
+      "gridPos": {"x": 0, "y": 5, "w": 24, "h": 1}
+    },
+    {
+      "id": 1010,
+      "type": "text",
+      "title": "",
+      "gridPos": {"x": 0, "y": 6, "w": 24, "h": 2},
+      "options": {
+        "mode": "markdown",
+        "content": "Six tiles showing the overall health of the system. If everything else is healthy, **Reconnects** stays at 0 and **Drop rate** tracks whatever the active profile is configured for."
+      }
     },
     {
       "id": 1,
       "type": "stat",
       "title": "Active QUIC connections",
-      "description": "Server-side QUIC connections currently up.",
-      "gridPos": {"x": 0, "y": 1, "w": 4, "h": 4},
+      "description": "Number of client devices currently connected to the server over QUIC. Each device keeps one connection open, even though it runs three different workloads (pubsub, uploads, polling) over it. With a 10-client fleet you should see 10.",
+      "gridPos": {"x": 0, "y": 8, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{"refId": "A", "expr": "quixiot_server_connections_active"}],
       "fieldConfig": {
@@ -102,8 +123,8 @@
       "id": 2,
       "type": "stat",
       "title": "Pubsub subscribers",
-      "description": "Total subscriber slots across all topics.",
-      "gridPos": {"x": 4, "y": 1, "w": 4, "h": 4},
+      "description": "How many subscribers the server is fanning messages out to, summed across all topics. Every `subscriber` or `mixed`-role client adds one per topic it joins.",
+      "gridPos": {"x": 4, "y": 8, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{"refId": "A", "expr": "sum(quixiot_server_pubsub_subscribers)"}],
       "fieldConfig": {
@@ -119,8 +140,8 @@
       "id": 3,
       "type": "stat",
       "title": "Active proxy sessions",
-      "description": "NAT entries kept open by the impairment proxy.",
-      "gridPos": {"x": 8, "y": 1, "w": 4, "h": 4},
+      "description": "Number of client↔server flows the impairment proxy is tracking right now. One session per client. Sessions are evicted after 5 minutes of no traffic.",
+      "gridPos": {"x": 8, "y": 8, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{"refId": "A", "expr": "quixiot_proxy_sessions_active"}],
       "fieldConfig": {
@@ -136,8 +157,8 @@
       "id": 4,
       "type": "stat",
       "title": "Reconnects (5m rate)",
-      "description": "Should hover at 0 — non-zero means a client tore the QUIC connection down.",
-      "gridPos": {"x": 12, "y": 1, "w": 4, "h": 4},
+      "description": "Rate at which clients have had to tear down their QUIC connection and redo the handshake. This is the headline QUIC-resilience number: it should stay at 0 even on `flaky` (15% loss). Anything above zero means the connection broke and had to be rebuilt.",
+      "gridPos": {"x": 12, "y": 8, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{"refId": "A", "expr": "sum(rate(quixiot_client_reconnects_total[5m]))"}],
       "fieldConfig": {
@@ -161,8 +182,8 @@
       "id": 5,
       "type": "stat",
       "title": "Drop rate to_server",
-      "description": "Observed proxy drop rate inbound to the server (1m window).",
-      "gridPos": {"x": 16, "y": 1, "w": 4, "h": 4},
+      "description": "Fraction of client→server packets the proxy is dropping right now (1-minute window). Should fluctuate around the profile's configured `drop_probability` — e.g. ~15% on `flaky`, ~0.2% on `wifi-good`.",
+      "gridPos": {"x": 16, "y": 8, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -190,8 +211,8 @@
       "id": 6,
       "type": "stat",
       "title": "Throughput",
-      "description": "Bytes/sec across the proxy in both directions (1m window).",
-      "gridPos": {"x": 20, "y": 1, "w": 4, "h": 4},
+      "description": "Total bytes/sec flowing through the proxy, both directions combined (1-minute window). Dominated by file uploads when the uploader role is active; otherwise dominated by pubsub datagrams and poll responses.",
+      "gridPos": {"x": 20, "y": 8, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{"refId": "A", "expr": "sum(rate(quixiot_proxy_bytes_total[1m]))"}],
       "fieldConfig": {
@@ -207,16 +228,26 @@
     {
       "id": 200,
       "type": "row",
-      "title": "Network impairment",
+      "title": "What the proxy is doing to the network",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 5, "w": 24, "h": 1}
+      "gridPos": {"x": 0, "y": 12, "w": 24, "h": 1}
+    },
+    {
+      "id": 1020,
+      "type": "text",
+      "title": "",
+      "gridPos": {"x": 0, "y": 13, "w": 24, "h": 2},
+      "options": {
+        "mode": "markdown",
+        "content": "The impairment proxy sits between each client and the server and simulates a flaky network link according to the active profile YAML (`configs/proxy-*.yaml`). These panels show **what the proxy is actually doing** — compare against the profile's configured `drop_probability`, `latency`, `jitter`, and `bandwidth` values."
+      }
     },
     {
       "id": 10,
       "type": "timeseries",
       "title": "Drop rate by direction",
-      "description": "rate(drops) / rate(packets) per direction. Compare with the configured profile to see jitter.",
-      "gridPos": {"x": 0, "y": 6, "w": 12, "h": 8},
+      "description": "Observed packet-drop rate, split by direction:\n- `to_server` = uplink (client → server)\n- `to_client` = downlink (server → client)\n\nCompare with the profile's configured `drop_probability`: the live value naturally fluctuates around it.",
+      "gridPos": {"x": 0, "y": 15, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -237,8 +268,8 @@
       "id": 11,
       "type": "heatmap",
       "title": "Enforced delay distribution",
-      "description": "Latency + jitter the proxy adds per packet, per direction.",
-      "gridPos": {"x": 12, "y": 6, "w": 12, "h": 8},
+      "description": "Heatmap of the latency the proxy adds to each packet, **aggregated across both directions** (uplink + downlink). Each profile sets a base `latency` plus a ±`jitter` range — you'll see a band centered on `latency` with width ≈ 2·`jitter`. For a per-direction view, use the `Direction` variable to filter.",
+      "gridPos": {"x": 12, "y": 15, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -261,8 +292,8 @@
       "id": 12,
       "type": "timeseries",
       "title": "Packets/sec by direction",
-      "description": "Stacked packet flow through the proxy.",
-      "gridPos": {"x": 0, "y": 14, "w": 12, "h": 7},
+      "description": "UDP packets/sec through the proxy, stacked by direction. The shape tells you what the workload is doing: chatty pubsub = high steady rate; file upload = fewer but larger packets (see bytes/sec for that axis).",
+      "gridPos": {"x": 0, "y": 23, "w": 12, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -283,8 +314,8 @@
       "id": 13,
       "type": "timeseries",
       "title": "Drops / dupes / reorders rate",
-      "description": "Per-direction impairment counters, per-second.",
-      "gridPos": {"x": 12, "y": 14, "w": 12, "h": 7},
+      "description": "Per-second count of each impairment the proxy applied, split by direction. Not every profile enables all three — `wifi-good` only drops occasionally; `flaky` applies all of them, which is why it's called flaky.",
+      "gridPos": {"x": 12, "y": 23, "w": 12, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "sum by(direction) (rate(quixiot_proxy_dropped_total{direction=~\"$direction\"}[$__rate_interval]))", "legendFormat": "drop {{direction}}"},
@@ -305,16 +336,26 @@
     {
       "id": 300,
       "type": "row",
-      "title": "QUIC resilience",
+      "title": "Does the connection survive?",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 21, "w": 24, "h": 1}
+      "gridPos": {"x": 0, "y": 30, "w": 24, "h": 1}
+    },
+    {
+      "id": 1030,
+      "type": "text",
+      "title": "",
+      "gridPos": {"x": 0, "y": 31, "w": 24, "h": 2},
+      "options": {
+        "mode": "markdown",
+        "content": "The key question for a lossy link: **can one QUIC connection stay up despite continuous packet loss?** QUIC is supposed to tolerate loss transparently — it retransmits lost data on reliable streams and keeps the connection alive via keepalive frames. Reconnects should stay at **zero** through every profile; handshakes should happen only at startup."
+      }
     },
     {
       "id": 20,
       "type": "heatmap",
       "title": "Client handshake duration",
-      "description": "Each client opens 2 QUIC connections at startup (H3 + WebTransport). Expect a single burst, then nothing — re-handshakes mean trouble.",
-      "gridPos": {"x": 0, "y": 22, "w": 12, "h": 8},
+      "description": "How long QUIC+TLS took to establish, per client. Each client does this twice at startup: once for HTTP/3 and once for WebTransport (unless coalesced onto a single connection, which this build does). After the startup burst you should see nothing — any later activity means something reconnected.",
+      "gridPos": {"x": 0, "y": 33, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -334,8 +375,8 @@
       "id": 21,
       "type": "timeseries",
       "title": "RTT (smoothed) per client",
-      "description": "QUIC's reported smoothed RTT — should be stable through loss, not spiking.",
-      "gridPos": {"x": 12, "y": 22, "w": 12, "h": 8},
+      "description": "QUIC's internal estimate of round-trip time, per client, from `quic.Connection.ConnectionState()`. On a lossy link this should stay stable — QUIC's congestion control dampens single-packet jitter. If RTT spikes with every drop, something is off.",
+      "gridPos": {"x": 12, "y": 33, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -356,8 +397,8 @@
       "id": 22,
       "type": "timeseries",
       "title": "Handshakes vs reconnects (cumulative)",
-      "description": "Handshakes count grows on connect; reconnects should stay flat at 0.",
-      "gridPos": {"x": 0, "y": 30, "w": 12, "h": 7},
+      "description": "Cumulative counts, not rates:\n- **handshakes** (blue) — grows once per client at startup (or twice if H3 and WT aren't coalesced). Should be flat after that.\n- **reconnects** (red) — should stay flat at 0 for the entire run. Any growth means a client had to rebuild its connection.",
+      "gridPos": {"x": 0, "y": 41, "w": 12, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "sum(quixiot_client_handshake_duration_seconds_count{client_id=~\"$client_id\"})", "legendFormat": "handshakes"},
@@ -379,7 +420,8 @@
       "id": 23,
       "type": "stat",
       "title": "Reconnects in selected range",
-      "gridPos": {"x": 12, "y": 30, "w": 6, "h": 7},
+      "description": "Total reconnects across all selected clients within the dashboard's time range. Zero is the healthy value — any non-zero number means a connection broke and had to be rebuilt, i.e. QUIC's loss recovery failed.",
+      "gridPos": {"x": 12, "y": 41, "w": 6, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{"refId": "A", "expr": "sum(increase(quixiot_client_reconnects_total{client_id=~\"$client_id\"}[$__range]))"}],
       "fieldConfig": {
@@ -396,7 +438,8 @@
       "id": 24,
       "type": "stat",
       "title": "Median handshake (s)",
-      "gridPos": {"x": 18, "y": 30, "w": 6, "h": 7},
+      "description": "Median time to complete the QUIC+TLS handshake, computed from the histogram. Because QUIC finishes the handshake in 1 RTT (vs 2-3 for TLS-over-TCP), this value is close to the active profile's RTT.",
+      "gridPos": {"x": 18, "y": 41, "w": 6, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -416,16 +459,26 @@
     {
       "id": 400,
       "type": "row",
-      "title": "WebTransport pubsub",
+      "title": "Real-time messages (pubsub)",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 37, "w": 24, "h": 1}
+      "gridPos": {"x": 0, "y": 48, "w": 24, "h": 1}
+    },
+    {
+      "id": 1040,
+      "type": "text",
+      "title": "",
+      "gridPos": {"x": 0, "y": 49, "w": 24, "h": 2},
+      "options": {
+        "mode": "markdown",
+        "content": "WebTransport multiplexes many independent streams plus fire-and-forget **datagrams** onto one QUIC connection. Clients publish and subscribe on named topics. Datagrams are fast but unreliable — dropped datagrams are **not** retransmitted (the tradeoff is lower latency). Streams are reliable but subject to head-of-line blocking within each stream."
+      }
     },
     {
       "id": 30,
       "type": "timeseries",
       "title": "Datagrams in/out by topic",
-      "description": "Datagram throughput on each WT session, split by direction (out=publisher, in=subscriber).",
-      "gridPos": {"x": 0, "y": 38, "w": 12, "h": 8},
+      "description": "Datagram rate on each WebTransport session, split by direction:\n- `out` = this client publishing\n- `in` = this client receiving (delivered by the broker)\n\nPer-topic breakdown comes from the `topic` variable.",
+      "gridPos": {"x": 0, "y": 51, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -446,8 +499,8 @@
       "id": 31,
       "type": "timeseries",
       "title": "Datagram round-trip loss % by topic",
-      "description": "Computed: (out − in) / out. The headline contrast vs reliable streams.",
-      "gridPos": {"x": 12, "y": 38, "w": 12, "h": 8},
+      "description": "Computed: `(out − in) / out` across all selected clients. Treats the fleet as one broadcast domain: if any publisher sends `N` datagrams on a topic, subscribers should collectively receive `N × subscribers`. This ratio is the headline contrast vs reliable streams — expect near-zero on `wifi-good`, visible gaps on `flaky`.",
+      "gridPos": {"x": 12, "y": 51, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -468,8 +521,8 @@
       "id": 32,
       "type": "timeseries",
       "title": "Publish-to-receive latency p50/p95/p99",
-      "description": "Subscriber timestamps each delivered message vs the publisher's stamped timestamp. Mixes datagram + stream surfaces.",
-      "gridPos": {"x": 0, "y": 46, "w": 12, "h": 8},
+      "description": "Wall-clock time from when a publisher stamped a message to when the subscriber received it. Because a `mixed`-role client is both publisher and subscriber on the same process, there's no clock skew. Mixes both datagram and stream surfaces — the stream tail shows retransmissions under loss.",
+      "gridPos": {"x": 0, "y": 59, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(quixiot_client_publish_latency_seconds_bucket{client_id=~\"$client_id\"}[$__rate_interval])))", "legendFormat": "p50"},
@@ -490,8 +543,8 @@
       "id": 33,
       "type": "timeseries",
       "title": "Pubsub drops by reason / surface",
-      "description": "Server-side drops when a subscriber's outbound queue is full.",
-      "gridPos": {"x": 12, "y": 46, "w": 12, "h": 8},
+      "description": "When the server can't keep up delivering to a subscriber, it drops messages rather than block:\n- `surface` — whether the drop was on the datagram path or a stream.\n- `reason` — why (queue_full, closed, oversize, …).\n\nDatagram drops are expected under heavy load; stream drops indicate a slow subscriber.",
+      "gridPos": {"x": 12, "y": 59, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -512,16 +565,26 @@
     {
       "id": 500,
       "type": "row",
-      "title": "HTTP/3 workload",
+      "title": "File uploads & state polls",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 54, "w": 24, "h": 1}
+      "gridPos": {"x": 0, "y": 67, "w": 24, "h": 1}
+    },
+    {
+      "id": 1050,
+      "type": "text",
+      "title": "",
+      "gridPos": {"x": 0, "y": 68, "w": 24, "h": 2},
+      "options": {
+        "mode": "markdown",
+        "content": "The other two workloads sharing the same QUIC connection: streaming **file uploads** (`POST /files/*`, body verified with SHA-256) and stateless **polling** (`GET /state` and `GET /config/{id}` on a ticker). The latency tail tells you how each profile impacts bulk transfer vs small request/response."
+      }
     },
     {
       "id": 40,
       "type": "timeseries",
       "title": "Request rate by path",
-      "description": "Server-side HTTP/3 requests per second by handler.",
-      "gridPos": {"x": 0, "y": 55, "w": 12, "h": 7},
+      "description": "Server-side HTTP/3 requests per second, broken down by method, path, and HTTP status:\n- `/state` — client poller hits it on a ticker\n- `/config/{clientID}` — per-client config endpoint\n- `/files/{name}` — file upload target\n- `/metrics` — Prometheus scraping the server's in-band endpoint",
+      "gridPos": {"x": 0, "y": 70, "w": 12, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -542,7 +605,8 @@
       "id": 41,
       "type": "timeseries",
       "title": "Server request latency p50/p95/p99",
-      "gridPos": {"x": 12, "y": 55, "w": 12, "h": 7},
+      "description": "Server-side latency per HTTP/3 handler, split by path. Measured from request arrival to response written. p99 is more sensitive to tail effects from packet loss and bandwidth caps.",
+      "gridPos": {"x": 12, "y": 70, "w": 12, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le, path) (rate(quixiot_server_http_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{path}}"},
@@ -563,7 +627,8 @@
       "id": 42,
       "type": "timeseries",
       "title": "Upload bytes/sec",
-      "gridPos": {"x": 0, "y": 62, "w": 12, "h": 6},
+      "description": "Payload bytes/sec **handed to the server's upload handler**, from `quixiot_server_upload_bytes`. This is application-layer data, not raw wire bytes (for wire bytes see *Bytes/sec by direction* in the proxy row). Shape: steep ramps during each upload, flat between.",
+      "gridPos": {"x": 0, "y": 77, "w": 12, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -584,7 +649,8 @@
       "id": 43,
       "type": "heatmap",
       "title": "Upload duration distribution",
-      "gridPos": {"x": 12, "y": 62, "w": 12, "h": 6},
+      "description": "Heatmap of how long each upload took, from the server's upload handler. Under loss and bandwidth caps the distribution shifts right — `satellite` and `flaky` produce long tails here.",
+      "gridPos": {"x": 12, "y": 77, "w": 12, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -604,15 +670,26 @@
     {
       "id": 600,
       "type": "row",
-      "title": "Proxy detail",
+      "title": "Proxy internals (advanced)",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 68, "w": 24, "h": 1}
+      "gridPos": {"x": 0, "y": 83, "w": 24, "h": 1}
+    },
+    {
+      "id": 1060,
+      "type": "text",
+      "title": "",
+      "gridPos": {"x": 0, "y": 84, "w": 24, "h": 2},
+      "options": {
+        "mode": "markdown",
+        "content": "Deeper diagnostics for the impairment proxy — raw byte rates, session lifecycle, and enforced-delay percentiles. Mostly useful when sanity-checking that the proxy is actually doing what the active profile says it should."
+      }
     },
     {
       "id": 50,
       "type": "timeseries",
       "title": "Bytes/sec by direction",
-      "gridPos": {"x": 0, "y": 69, "w": 8, "h": 6},
+      "description": "Raw UDP bytes/sec through the proxy, per direction. Uploads dominate `to_server`; pubsub delivery and poll responses dominate `to_client`.",
+      "gridPos": {"x": 0, "y": 86, "w": 8, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{
         "refId": "A",
@@ -633,7 +710,8 @@
       "id": 51,
       "type": "timeseries",
       "title": "Sessions over time",
-      "gridPos": {"x": 8, "y": 69, "w": 8, "h": 6},
+      "description": "- **active** — proxy NAT entries currently open (gauge)\n- **total (cumulative)** — every session the proxy has ever tracked in this run (counter)\n\nIn a steady fleet the two diverge: active plateaus at the fleet size; total keeps rising only if clients disconnect/reconnect (which they shouldn't — if total keeps climbing, something's cycling NAT entries).",
+      "gridPos": {"x": 8, "y": 86, "w": 8, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "quixiot_proxy_sessions_active", "legendFormat": "active"},
@@ -653,7 +731,8 @@
       "id": 52,
       "type": "timeseries",
       "title": "Enforced delay p50/p95/p99",
-      "gridPos": {"x": 16, "y": 69, "w": 8, "h": 6},
+      "description": "Percentiles of the latency the proxy adds per packet, split by direction. p50 is near `latency`; p99 is near `latency + jitter`.",
+      "gridPos": {"x": 16, "y": 86, "w": 8, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le, direction) (rate(quixiot_proxy_enforced_delay_seconds_bucket{direction=~\"$direction\"}[$__rate_interval])))", "legendFormat": "p50 {{direction}}"},
@@ -669,6 +748,26 @@
         }
       },
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+
+    {
+      "id": 700,
+      "type": "row",
+      "title": "Glossary",
+      "collapsed": true,
+      "gridPos": {"x": 0, "y": 92, "w": 24, "h": 1},
+      "panels": [
+        {
+          "id": 1070,
+          "type": "text",
+          "title": "",
+          "gridPos": {"x": 0, "y": 93, "w": 24, "h": 14},
+          "options": {
+            "mode": "markdown",
+            "content": "### Glossary\n\n- **QUIC** — Transport protocol used by HTTP/3. Runs on UDP. Identifies each connection with a Connection ID (not an IP:port tuple), which is why it survives path changes like phone ↔ wifi.\n- **HTTP/3** — HTTP semantics running over QUIC. Plain request/response, same as HTTP/2 — different transport.\n- **WebTransport** — An API on top of HTTP/3 that exposes many bidirectional streams plus **datagrams** on one QUIC connection. Cheaper than opening separate connections per stream.\n- **Stream** — A reliable, in-order byte pipe within a QUIC connection. Loss on a stream is retransmitted. Multiple streams on one connection don't block each other (no head-of-line blocking between streams).\n- **Datagram** — An unreliable, unordered, length-delimited message within a QUIC connection. Lost datagrams are **not** retransmitted. Tradeoff: lower latency, no backpressure.\n- **RTT (round-trip time)** — Time from sending a packet to getting an ACK back. QUIC completes its handshake in 1 RTT (vs 2-3 for TLS-over-TCP).\n- **Handshake** — The initial key-exchange dance. Expensive (TLS + QUIC state). Reused on reconnects.\n- **Keepalive** — Small periodic packet sent by the client to prevent idle timeout on the connection. Client-side setting `KeepAlivePeriod` (15s here).\n- **Reconnect** — The event a client logs when it has to tear down its QUIC connection and redo the handshake. **In this PoC, reconnects should stay at 0** through every profile.\n- **Impairment profile** — YAML file in `configs/` describing the simulated network. Each profile has separate `to_server` and `to_client` settings for `drop_probability`, `latency`, `jitter`, and `bandwidth_bps`.\n- **NAT session** — One logical client↔server flow in the proxy, keyed by the client's source `ip:port`. Evicted after 5 minutes idle.\n- **Surface** (pubsub) — Which QUIC-level transport carried the message: `datagram` (unreliable) or `stream` (reliable).\n- **Direction** — `to_server` = uplink (client → server); `to_client` = downlink (server → client)."
+          }
+        }
+      ]
     }
   ]
 }
