@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -16,30 +18,40 @@ import (
 )
 
 type fleetConfig struct {
-	ClientBin       string
-	ServerURL       string
-	CAFile          string
-	Role            string
-	Count           int
-	StaggerMS       int
-	MetricsPortBase int
-	MetricsHost     string
-	TargetsFile     string
-	LogLevel        string
+	ClientBin        string
+	ServerURL        string
+	CAFile           string
+	Role             string
+	Count            int
+	StaggerMS        int
+	MetricsPortBase  int
+	MetricsHost      string
+	TargetsFile      string
+	LogLevel         string
+	LogFile          string
+	LogMaxBytes      int64
+	LogMaxFiles      int
+	ChildLogDir      string
+	ChildLogMaxBytes int64
+	ChildLogMaxFiles int
 }
 
 func defaults() fleetConfig {
 	return fleetConfig{
-		ClientBin:       defaultClientBinary(),
-		ServerURL:       "https://localhost:4444",
-		CAFile:          "var/certs/ca.pem",
-		Role:            "mixed",
-		Count:           10,
-		StaggerMS:       250,
-		MetricsPortBase: 9200,
-		MetricsHost:     "127.0.0.1",
-		TargetsFile:     "deploy/targets/clients.json",
-		LogLevel:        "info",
+		ClientBin:        defaultClientBinary(),
+		ServerURL:        "https://localhost:4444",
+		CAFile:           "var/certs/ca.pem",
+		Role:             "mixed",
+		Count:            10,
+		StaggerMS:        250,
+		MetricsPortBase:  9200,
+		MetricsHost:      "127.0.0.1",
+		TargetsFile:      "deploy/targets/clients.json",
+		LogLevel:         "info",
+		LogMaxBytes:      logging.DefaultFileMaxBytes,
+		LogMaxFiles:      logging.DefaultFileMaxFiles,
+		ChildLogMaxBytes: logging.DefaultFileMaxBytes,
+		ChildLogMaxFiles: logging.DefaultFileMaxFiles,
 	}
 }
 
@@ -64,6 +76,12 @@ func run(args []string) error {
 	metricsHost := fs.String("metrics-host", def.MetricsHost, "host that Prometheus uses to reach child clients (host.docker.internal when scraping from a container)")
 	targetsFile := fs.String("targets-file", def.TargetsFile, "Prometheus file_sd target list to write (empty disables)")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
+	logFile := fs.String("log-file", def.LogFile, "write fleet JSON logs to a rotating file instead of stderr")
+	logMaxBytes := fs.Int64("log-max-bytes", def.LogMaxBytes, "max bytes per fleet log file when --log-file is set")
+	logMaxFiles := fs.Int("log-max-files", def.LogMaxFiles, "max retained fleet log files including the active file")
+	childLogDir := fs.String("child-log-dir", def.ChildLogDir, "directory for per-child rotating client logs; empty inherits fleet stdout/stderr")
+	childLogMaxBytes := fs.Int64("child-log-max-bytes", def.ChildLogMaxBytes, "max bytes per child log file when --child-log-dir is set")
+	childLogMaxFiles := fs.Int("child-log-max-files", def.ChildLogMaxFiles, "max retained child log files including the active file")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -79,11 +97,21 @@ func run(args []string) error {
 	}
 	stagger := time.Duration(*staggerMS) * time.Millisecond
 
-	log, err := logging.New(logging.Options{Level: *logLevel})
+	log, err := logging.New(logging.Options{
+		Level:    *logLevel,
+		File:     *logFile,
+		MaxBytes: *logMaxBytes,
+		MaxFiles: *logMaxFiles,
+	})
 	if err != nil {
 		return err
 	}
 	logging.SetDefault(log)
+	if *childLogDir != "" {
+		if err := os.MkdirAll(*childLogDir, 0o755); err != nil {
+			return fmt.Errorf("fleet: create child log dir: %w", err)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -125,9 +153,21 @@ func run(args []string) error {
 			"--metrics-addr", c.MetricsAddr,
 			"--log-level", *logLevel,
 		}
+		if *childLogDir != "" {
+			args = append(args,
+				"--log-file", filepath.Join(*childLogDir, c.ID+".log"),
+				"--log-max-bytes", strconv.FormatInt(*childLogMaxBytes, 10),
+				"--log-max-files", strconv.Itoa(*childLogMaxFiles),
+			)
+		}
 		cmd := exec.CommandContext(ctx, *clientBin, args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		if *childLogDir == "" {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+		} else {
+			cmd.Stdout = io.Discard
+			cmd.Stderr = io.Discard
+		}
 		if err := cmd.Start(); err != nil {
 			stop()
 			return fmt.Errorf("fleet: start %s: %w", c.ID, err)

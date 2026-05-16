@@ -98,7 +98,7 @@ Start the observability stack (containers):
 
 ```sh
 make grafana                    # default 1 day retention
-PROM_RETENTION=24h make grafana # override (e.g. 24h, 7d)
+PROM_RETENTION=24h PROM_RETENTION_SIZE=2GB make grafana # override
 ```
 
 Start the workload (quixiot binaries, background):
@@ -111,6 +111,12 @@ make logs                            # tail -F server + proxy + fleet
 make restart PROFILE=satellite       # swap profiles without losing Prometheus history
 make down                            # SIGINT everything
 ```
+
+`make up` is storage-bounded by default: uploaded payloads in `var/uploads`
+are pruned to 1 GiB (`UPLOAD_MAX_BYTES=1073741824`), and each process log keeps
+three 10 MiB files (`LOG_MAX_FILES=3`, `LOG_MAX_BYTES=10485760`). Fleet child
+logs are written separately under `var/logs/clients/` so they cannot inflate
+`fleet.log`.
 
 Prefer to run a single component in the foreground (e.g. to watch server logs inline)? The existing `run-server`, `run-proxy`, `run-client`, `run-fleet` targets still work.
 
@@ -125,7 +131,10 @@ Open Grafana at <http://127.0.0.1:3000/d/quixiot-overview> (admin / admin; anony
 
 Variables: `client_id`, `topic`, and `direction` filter every panel.
 
-Tear it down (data volumes survive — drop them with `docker volume rm deploy_prom-data deploy_grafana-data` if you want a clean slate):
+Prometheus is also bounded by time and size (`PROM_RETENTION=1d`,
+`PROM_RETENTION_SIZE=1GB` by default). Tear it down (data volumes survive —
+drop them with `docker volume rm deploy_prom-data deploy_grafana-data` if you
+want a clean slate):
 
 ```sh
 make grafana-down
@@ -177,13 +186,14 @@ COUNT=25 PROFILE=flaky ./scripts/demo.sh
 - `make run-proxy PROFILE=cellular-lte`: run the proxy (metrics on `127.0.0.1:9104`)
 - `make run-client ROLE=mixed`: run one client through the proxy (set `CLIENT_METRICS_ADDR=` empty to disable scraping)
 - `make run-fleet COUNT=50 ROLE=mixed`: run a fleet through the proxy (per-child metrics from `127.0.0.1:9200`+)
+- `make up UPLOAD_MAX_BYTES=536870912 LOG_MAX_BYTES=5242880`: start the background stack with tighter upload/log caps
 - `make metrics`: print server and proxy metrics
 - `make verify`: run `scripts/verify.sh`
 - `make demo`: run `scripts/demo.sh`
 - `make grafana`: start the docker-compose Prometheus + Grafana stack (`PROM_RETENTION=1d` default)
 - `make grafana-down`: stop the observability stack
 - `make grafana-logs` / `make grafana-status`: tail logs / show container status
-- `make up`: start server + proxy (`PROFILE`) + fleet (`COUNT` × `ROLE`) in the background
+- `make up`: start server + proxy (`PROFILE`) + fleet (`COUNT` × `ROLE`) in the background with bounded upload/log storage
 - `make down`: stop the background workload
 - `make restart`: down, then up (useful for swapping `PROFILE`)
 - `make status` / `make logs`: component state / `tail -F` over all three logs
@@ -213,7 +223,7 @@ configs/                           proxy impairment profiles
 scripts/                           demo, verify, and helper tooling
 deploy/                            docker-compose, prometheus.yml, Grafana provisioning + dashboards
 testdata/                          fixture area
-var/{certs,uploads}/               runtime artifacts (gitignored)
+var/{certs,uploads,logs,run}/       runtime artifacts (gitignored)
 ```
 
 `plan.md` is a gitignored progress tracker for the phase-by-phase implementation history.

@@ -7,6 +7,7 @@ CA_FILE ?= $(CERT_DIR)/ca.pem
 CERT_FILE ?= $(CERT_DIR)/server.pem
 KEY_FILE ?= $(CERT_DIR)/server.key
 UPLOAD_DIR ?= var/uploads
+UPLOAD_MAX_BYTES ?= 1073741824
 
 SERVER_ADDR ?= 127.0.0.1:4444
 SERVER_METRICS_PLAIN_ADDR ?= 127.0.0.1:9103
@@ -21,6 +22,8 @@ COUNT ?= 10
 ROLE ?=
 PROFILE ?= passthrough
 LOG_LEVEL ?= info
+LOG_MAX_BYTES ?= 10485760
+LOG_MAX_FILES ?= 3
 
 FLEET_METRICS_PORT_BASE ?= 9200
 # Advertised host for per-child metrics in deploy/targets/clients.json.
@@ -31,6 +34,7 @@ FLEET_TARGETS_FILE ?= deploy/targets/clients.json
 
 STACK_RUN_DIR ?= var/run
 STACK_LOG_DIR ?= var/logs
+STACK_CLIENT_LOG_DIR ?= $(STACK_LOG_DIR)/clients
 
 CLIENT_ROLE = $(or $(ROLE),poller)
 FLEET_ROLE = $(or $(ROLE),mixed)
@@ -41,6 +45,7 @@ COMPOSE_FILE ?= deploy/docker-compose.yml
 PROM_PORT ?= 9090
 GF_PORT ?= 3000
 PROM_RETENTION ?= 1d
+PROM_RETENTION_SIZE ?= 1GB
 
 .PHONY: all build $(CMDS) test vet fmt tidy clean help certs run-server run-proxy run-client run-fleet demo verify metrics grafana grafana-down grafana-logs grafana-status observability observability-down up down restart status logs
 
@@ -77,6 +82,7 @@ run-server: server certs
 		--cert-file $(CERT_FILE) \
 		--key-file $(KEY_FILE) \
 		--upload-dir $(UPLOAD_DIR) \
+		--upload-max-bytes $(UPLOAD_MAX_BYTES) \
 		--metrics-plain-addr $(SERVER_METRICS_PLAIN_ADDR) \
 		--log-level $(LOG_LEVEL)
 
@@ -126,16 +132,16 @@ metrics: certs
 
 # Bring up the Grafana + Prometheus stack. Components keep running on the host
 # so Prometheus reaches them via host.docker.internal:<port>. Override
-# PROM_RETENTION (default 1d) to extend history (e.g. PROM_RETENTION=24h, 7d).
+# PROM_RETENTION (default 1d) or PROM_RETENTION_SIZE (default 1GB) to extend history.
 grafana:
 	@mkdir -p deploy/targets
 	@if [ ! -f $(FLEET_TARGETS_FILE) ]; then echo '[]' > $(FLEET_TARGETS_FILE); fi
-	PROM_PORT=$(PROM_PORT) GF_PORT=$(GF_PORT) PROM_RETENTION=$(PROM_RETENTION) \
+	PROM_PORT=$(PROM_PORT) GF_PORT=$(GF_PORT) PROM_RETENTION=$(PROM_RETENTION) PROM_RETENTION_SIZE=$(PROM_RETENTION_SIZE) \
 		$(COMPOSE) -f $(COMPOSE_FILE) up -d
 	@echo
 	@echo "Grafana:    http://127.0.0.1:$(GF_PORT)/d/quixiot/quixiot-overview (admin/admin)"
 	@echo "Prometheus: http://127.0.0.1:$(PROM_PORT)/targets"
-	@echo "Retention:  $(PROM_RETENTION)  (override with PROM_RETENTION=...)"
+	@echo "Retention:  $(PROM_RETENTION), $(PROM_RETENTION_SIZE)  (override with PROM_RETENTION=... PROM_RETENTION_SIZE=...)"
 
 grafana-down:
 	$(COMPOSE) -f $(COMPOSE_FILE) down
@@ -155,32 +161,41 @@ observability-down: grafana-down
 # Bring up the workload in the background: server, proxy on PROFILE, fleet
 # of COUNT x FLEET_ROLE. PIDs land in $(STACK_RUN_DIR); logs in $(STACK_LOG_DIR).
 # Pairs with `make grafana` — the Grafana dashboard renders live once both are up.
-# Overrides: PROFILE, COUNT, ROLE, LOG_LEVEL, SERVER_ADDR, PROXY_LISTEN, etc.
+# Storage is bounded by default: uploads are pruned at $(UPLOAD_MAX_BYTES) bytes
+# and each process log keeps $(LOG_MAX_FILES) x $(LOG_MAX_BYTES)-byte files.
+# Overrides: PROFILE, COUNT, ROLE, LOG_LEVEL, UPLOAD_MAX_BYTES, LOG_MAX_BYTES, etc.
 up: build certs
-	@mkdir -p $(STACK_RUN_DIR) $(STACK_LOG_DIR) $(UPLOAD_DIR)
+	@mkdir -p $(STACK_RUN_DIR) $(STACK_LOG_DIR) $(STACK_CLIENT_LOG_DIR) $(UPLOAD_DIR)
 	@if [ -f $(STACK_RUN_DIR)/server.pid ] && kill -0 $$(cat $(STACK_RUN_DIR)/server.pid) 2>/dev/null; then \
 		echo "up: server already running (pid $$(cat $(STACK_RUN_DIR)/server.pid)); run 'make down' first" >&2; \
 		exit 1; \
 	fi
 	@rm -f $(STACK_RUN_DIR)/server.pid $(STACK_RUN_DIR)/proxy.pid $(STACK_RUN_DIR)/fleet.pid
-	@$(BIN)/server \
+	@nohup $(BIN)/server \
 		--addr $(SERVER_ADDR) \
 		--cert-file $(CERT_FILE) \
 		--key-file $(KEY_FILE) \
 		--upload-dir $(UPLOAD_DIR) \
+		--upload-max-bytes $(UPLOAD_MAX_BYTES) \
 		--metrics-plain-addr $(SERVER_METRICS_PLAIN_ADDR) \
 		--log-level $(LOG_LEVEL) \
-		>$(STACK_LOG_DIR)/server.log 2>&1 & echo $$! > $(STACK_RUN_DIR)/server.pid
+		--log-file $(STACK_LOG_DIR)/server.log \
+		--log-max-bytes $(LOG_MAX_BYTES) \
+		--log-max-files $(LOG_MAX_FILES) \
+		>/dev/null 2>&1 & echo $$! > $(STACK_RUN_DIR)/server.pid
 	@sleep 1
-	@$(BIN)/proxy \
+	@nohup $(BIN)/proxy \
 		--listen $(PROXY_LISTEN) \
 		--upstream $(PROXY_UPSTREAM) \
 		--profile $(PROFILE) \
 		--metrics-addr $(PROXY_METRICS_ADDR) \
 		--log-level $(LOG_LEVEL) \
-		>$(STACK_LOG_DIR)/proxy.log 2>&1 & echo $$! > $(STACK_RUN_DIR)/proxy.pid
+		--log-file $(STACK_LOG_DIR)/proxy.log \
+		--log-max-bytes $(LOG_MAX_BYTES) \
+		--log-max-files $(LOG_MAX_FILES) \
+		>/dev/null 2>&1 & echo $$! > $(STACK_RUN_DIR)/proxy.pid
 	@sleep 1
-	@$(BIN)/fleet \
+	@nohup $(BIN)/fleet \
 		--client-bin $(BIN)/client \
 		--server-url $(SERVER_URL) \
 		--ca-file $(CA_FILE) \
@@ -190,12 +205,19 @@ up: build certs
 		--metrics-host $(FLEET_METRICS_HOST) \
 		--targets-file $(FLEET_TARGETS_FILE) \
 		--log-level $(LOG_LEVEL) \
-		>$(STACK_LOG_DIR)/fleet.log 2>&1 & echo $$! > $(STACK_RUN_DIR)/fleet.pid
+		--log-file $(STACK_LOG_DIR)/fleet.log \
+		--log-max-bytes $(LOG_MAX_BYTES) \
+		--log-max-files $(LOG_MAX_FILES) \
+		--child-log-dir $(STACK_CLIENT_LOG_DIR) \
+		--child-log-max-bytes $(LOG_MAX_BYTES) \
+		--child-log-max-files $(LOG_MAX_FILES) \
+		>/dev/null 2>&1 & echo $$! > $(STACK_RUN_DIR)/fleet.pid
 	@sleep 2
 	@echo "up: profile=$(PROFILE) count=$(COUNT) role=$(FLEET_ROLE)"
 	@echo "  server pid: $$(cat $(STACK_RUN_DIR)/server.pid)   log: $(STACK_LOG_DIR)/server.log"
 	@echo "  proxy  pid: $$(cat $(STACK_RUN_DIR)/proxy.pid)   log: $(STACK_LOG_DIR)/proxy.log"
 	@echo "  fleet  pid: $$(cat $(STACK_RUN_DIR)/fleet.pid)   log: $(STACK_LOG_DIR)/fleet.log"
+	@echo "  caps: uploads=$(UPLOAD_MAX_BYTES) bytes, logs=$(LOG_MAX_FILES)x$(LOG_MAX_BYTES) bytes per process"
 	@echo "  grafana:    http://127.0.0.1:$(GF_PORT)/d/quixiot-overview  (run 'make grafana' first if needed)"
 
 # Stop the workload. Sends SIGINT for an orderly QUIC close. Also sweeps
@@ -237,7 +259,12 @@ status:
 
 # Follow all three logs together. Ctrl-C to exit.
 logs:
-	@tail -n 40 -F $(STACK_LOG_DIR)/server.log $(STACK_LOG_DIR)/proxy.log $(STACK_LOG_DIR)/fleet.log
+	@files="$(STACK_LOG_DIR)/server.log $(STACK_LOG_DIR)/proxy.log $(STACK_LOG_DIR)/fleet.log"; \
+	if [ -d "$(STACK_CLIENT_LOG_DIR)" ]; then \
+		child_logs=$$(find "$(STACK_CLIENT_LOG_DIR)" -maxdepth 1 -name '*.log' -print | sort | tr '\n' ' '); \
+		files="$$files $$child_logs"; \
+	fi; \
+	tail -n 40 -F $$files
 
 help:
 	@echo "Targets:"
@@ -259,8 +286,8 @@ help:
 	@echo "  grafana-down     stop the docker compose stack"
 	@echo "  grafana-logs     tail compose logs"
 	@echo "  grafana-status   show compose container status"
-	@echo "  up               start server + proxy (PROFILE=$(PROFILE)) + fleet (COUNT=$(COUNT)) in background"
+	@echo "  up               start server + proxy (PROFILE=$(PROFILE)) + fleet (COUNT=$(COUNT)) in background with bounded logs/uploads"
 	@echo "  down             stop the background workload (SIGINT)"
 	@echo "  restart          down then up"
 	@echo "  status           show running/stopped state per component"
-	@echo "  logs             tail -F server + proxy + fleet logs"
+	@echo "  logs             tail -F server + proxy + fleet/client logs"

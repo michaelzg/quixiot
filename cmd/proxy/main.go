@@ -29,6 +29,9 @@ type proxyConfig struct {
 	Profile     string `yaml:"profile"`
 	MetricsAddr string `yaml:"metrics_addr"`
 	LogLevel    string `yaml:"log_level"`
+	LogFile     string `yaml:"log_file"`
+	LogMaxBytes int64  `yaml:"log_max_bytes"`
+	LogMaxFiles int    `yaml:"log_max_files"`
 }
 
 func defaults() proxyConfig {
@@ -38,6 +41,8 @@ func defaults() proxyConfig {
 		Profile:     "passthrough",
 		MetricsAddr: "127.0.0.1:9104",
 		LogLevel:    "info",
+		LogMaxBytes: logging.DefaultFileMaxBytes,
+		LogMaxFiles: logging.DefaultFileMaxFiles,
 	}
 }
 
@@ -58,6 +63,9 @@ func run(args []string) error {
 	profile := fs.String("profile", def.Profile, "network profile: passthrough|wifi-good|cellular-lte|cellular-3g|satellite|flaky or a profile YAML path")
 	metricsAddr := fs.String("metrics-addr", def.MetricsAddr, "Prometheus metrics listen address")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
+	logFile := fs.String("log-file", def.LogFile, "write JSON logs to a rotating file instead of stderr")
+	logMaxBytes := fs.Int64("log-max-bytes", def.LogMaxBytes, "max bytes per log file when --log-file is set")
+	logMaxFiles := fs.Int("log-max-files", def.LogMaxFiles, "max retained log files including the active file")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -79,6 +87,12 @@ func run(args []string) error {
 			cfg.MetricsAddr = *metricsAddr
 		case "log-level":
 			cfg.LogLevel = *logLevel
+		case "log-file":
+			cfg.LogFile = *logFile
+		case "log-max-bytes":
+			cfg.LogMaxBytes = *logMaxBytes
+		case "log-max-files":
+			cfg.LogMaxFiles = *logMaxFiles
 		}
 	})
 
@@ -87,7 +101,12 @@ func run(args []string) error {
 		return err
 	}
 
-	log, err := logging.New(logging.Options{Level: cfg.LogLevel})
+	log, err := logging.New(logging.Options{
+		Level:    cfg.LogLevel,
+		File:     cfg.LogFile,
+		MaxBytes: cfg.LogMaxBytes,
+		MaxFiles: cfg.LogMaxFiles,
+	})
 	if err != nil {
 		return err
 	}

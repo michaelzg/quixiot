@@ -49,7 +49,7 @@ func (s Subscriber) Run(ctx context.Context) error {
 				return nil
 			}
 			counts[msg.Topic]++
-			s.logger().Info("received pubsub message",
+			s.logger().Debug("received pubsub message",
 				"topic", msg.Topic,
 				"surface", msg.Surface,
 				"bytes", len(msg.Payload),

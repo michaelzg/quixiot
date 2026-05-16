@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 const (
 	defaultVersion                    = "dev"
 	defaultPollIntervalSeconds        = 5
+	DefaultUploadMaxBytes             = int64(1 << 30)
 	defaultMaxIdleTimeout             = 45 * time.Second
 	defaultInitialStreamReceiveWindow = 512 * 1024
 	defaultMaxStreamReceiveWindow     = 8 * 1024 * 1024
@@ -45,7 +47,9 @@ type Options struct {
 	Version    string
 	StartedAt  time.Time
 	UploadDir  string
-	Metrics    *metrics.ServerMetrics
+	// UploadMaxBytes caps retained upload files. Zero uses DefaultUploadMaxBytes.
+	UploadMaxBytes int64
+	Metrics        *metrics.ServerMetrics
 }
 
 type Server struct {
@@ -93,6 +97,27 @@ func New(opts Options) (*Server, error) {
 	if uploadDir == "" {
 		uploadDir = "var/uploads"
 	}
+	uploadMaxBytes := opts.UploadMaxBytes
+	if uploadMaxBytes < 0 {
+		return nil, fmt.Errorf("server: upload max bytes must be non-negative")
+	}
+	if uploadMaxBytes == 0 {
+		uploadMaxBytes = DefaultUploadMaxBytes
+	}
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		return nil, fmt.Errorf("server: create upload dir: %w", err)
+	}
+	if pruned, err := upload.PruneDir(uploadDir, uploadMaxBytes, ""); err != nil {
+		return nil, fmt.Errorf("server: prune upload dir: %w", err)
+	} else if pruned.RemovedFiles > 0 {
+		log.Warn("pruned upload storage at startup",
+			"dir", uploadDir,
+			"max_bytes", pruned.MaxBytes,
+			"remaining_bytes", pruned.RemainingBytes,
+			"removed_files", pruned.RemovedFiles,
+			"removed_bytes", pruned.RemovedBytes,
+		)
+	}
 	version := opts.Version
 	if version == "" {
 		version = defaultVersion
@@ -115,8 +140,9 @@ func New(opts Options) (*Server, error) {
 	mux.HandleFunc("GET /state", s.handleState)
 	mux.HandleFunc("GET /config/{clientID}", s.handleConfig)
 	mux.Handle("POST /files/{name}", upload.Handler{
-		Dir:    uploadDir,
-		Logger: log,
+		Dir:             uploadDir,
+		Logger:          log,
+		MaxStorageBytes: uploadMaxBytes,
 		OnStored: func(resp upload.Response) {
 			if s.metrics == nil {
 				return
@@ -247,7 +273,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		reqLog.Error("write state response", "error", err)
 		return
 	}
-	reqLog.Info("served state", "uptime_millis", resp.UptimeMillis)
+	reqLog.Debug("served state", "uptime_millis", resp.UptimeMillis)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +290,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		reqLog.Error("write config response", "error", err)
 		return
 	}
-	reqLog.Info("served config")
+	reqLog.Debug("served config")
 }
 
 func (s *Server) handlePubSub(w http.ResponseWriter, r *http.Request) {

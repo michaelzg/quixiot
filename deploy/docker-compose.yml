@@ -6,6 +6,7 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=${PROM_RETENTION:-1d}
+      - --storage.tsdb.retention.size=${PROM_RETENTION_SIZE:-1GB}
       - --web.enable-lifecycle
       - --web.enable-admin-api
     volumes:
@@ -17,6 +18,11 @@ services:
     extra_hosts:
       # Lets the container reach the host (where server/proxy/clients run).
       - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+        max-file: "${DOCKER_LOG_MAX_FILE:-3}"
     restart: unless-stopped
 
   grafana:
@@ -40,6 +46,11 @@ services:
       - "${GF_PORT:-3000}:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+        max-file: "${DOCKER_LOG_MAX_FILE:-3}"
     restart: unless-stopped
 
 volumes:
