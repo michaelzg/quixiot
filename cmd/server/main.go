@@ -30,24 +30,31 @@ import (
 const buildVersion = "dev"
 
 type serverConfig struct {
-	Addr            string `yaml:"addr"`
-	CertFile        string `yaml:"cert_file"`
-	KeyFile         string `yaml:"key_file"`
-	CAFile          string `yaml:"ca_file"`
-	UploadDir       string `yaml:"upload_dir"`
+	Addr             string `yaml:"addr"`
+	CertFile         string `yaml:"cert_file"`
+	KeyFile          string `yaml:"key_file"`
+	CAFile           string `yaml:"ca_file"`
+	UploadDir        string `yaml:"upload_dir"`
+	UploadMaxBytes   int64  `yaml:"upload_max_bytes"`
 	MetricsPlainAddr string `yaml:"metrics_plain_addr"`
-	LogLevel        string `yaml:"log_level"`
+	LogLevel         string `yaml:"log_level"`
+	LogFile          string `yaml:"log_file"`
+	LogMaxBytes      int64  `yaml:"log_max_bytes"`
+	LogMaxFiles      int    `yaml:"log_max_files"`
 }
 
 func defaults() serverConfig {
 	return serverConfig{
-		Addr:            ":4444",
-		CertFile:        "var/certs/server.pem",
-		KeyFile:         "var/certs/server.key",
-		CAFile:          "var/certs/ca.pem",
-		UploadDir:       "var/uploads",
+		Addr:             ":4444",
+		CertFile:         "var/certs/server.pem",
+		KeyFile:          "var/certs/server.key",
+		CAFile:           "var/certs/ca.pem",
+		UploadDir:        "var/uploads",
+		UploadMaxBytes:   server.DefaultUploadMaxBytes,
 		MetricsPlainAddr: "127.0.0.1:9103",
-		LogLevel:        "info",
+		LogLevel:         "info",
+		LogMaxBytes:      logging.DefaultFileMaxBytes,
+		LogMaxFiles:      logging.DefaultFileMaxFiles,
 	}
 }
 
@@ -68,8 +75,12 @@ func run(args []string) error {
 	keyFile := fs.String("key-file", def.KeyFile, "server leaf private key PEM")
 	caFile := fs.String("ca-file", def.CAFile, "CA certificate PEM path")
 	uploadDir := fs.String("upload-dir", def.UploadDir, "sandboxed upload directory")
+	uploadMaxBytes := fs.Int64("upload-max-bytes", def.UploadMaxBytes, "max retained upload bytes; 0 uses the safe default")
 	metricsPlainAddr := fs.String("metrics-plain-addr", def.MetricsPlainAddr, "Prometheus metrics listen address (plain HTTP, empty disables)")
 	logLevel := fs.String("log-level", def.LogLevel, "log level: debug|info|warn|error")
+	logFile := fs.String("log-file", def.LogFile, "write JSON logs to a rotating file instead of stderr")
+	logMaxBytes := fs.Int64("log-max-bytes", def.LogMaxBytes, "max bytes per log file when --log-file is set")
+	logMaxFiles := fs.Int("log-max-files", def.LogMaxFiles, "max retained log files including the active file")
 
 	genCerts := fs.Bool("gen-certs", false, "generate local CA + server leaf into --cert-dir and exit")
 	certDir := fs.String("cert-dir", "var/certs", "output directory for --gen-certs")
@@ -97,14 +108,27 @@ func run(args []string) error {
 			cfg.CAFile = *caFile
 		case "upload-dir":
 			cfg.UploadDir = *uploadDir
+		case "upload-max-bytes":
+			cfg.UploadMaxBytes = *uploadMaxBytes
 		case "metrics-plain-addr":
 			cfg.MetricsPlainAddr = *metricsPlainAddr
 		case "log-level":
 			cfg.LogLevel = *logLevel
+		case "log-file":
+			cfg.LogFile = *logFile
+		case "log-max-bytes":
+			cfg.LogMaxBytes = *logMaxBytes
+		case "log-max-files":
+			cfg.LogMaxFiles = *logMaxFiles
 		}
 	})
 
-	log, err := logging.New(logging.Options{Level: cfg.LogLevel})
+	log, err := logging.New(logging.Options{
+		Level:    cfg.LogLevel,
+		File:     cfg.LogFile,
+		MaxBytes: cfg.LogMaxBytes,
+		MaxFiles: cfg.LogMaxFiles,
+	})
 	if err != nil {
 		return err
 	}
@@ -140,12 +164,13 @@ func run(args []string) error {
 
 	serverMetrics := metrics.NewServer()
 	srv, err := server.New(server.Options{
-		PacketConn: pc,
-		TLSConfig:  tlsConf,
-		Logger:     log,
-		Version:    buildVersion,
-		UploadDir:  cfg.UploadDir,
-		Metrics:    serverMetrics,
+		PacketConn:     pc,
+		TLSConfig:      tlsConf,
+		Logger:         log,
+		Version:        buildVersion,
+		UploadDir:      cfg.UploadDir,
+		UploadMaxBytes: cfg.UploadMaxBytes,
+		Metrics:        serverMetrics,
 	})
 	if err != nil {
 		return err
@@ -164,6 +189,7 @@ func run(args []string) error {
 		"cert_file", cfg.CertFile,
 		"key_file", cfg.KeyFile,
 		"upload_dir", cfg.UploadDir,
+		"upload_max_bytes", cfg.UploadMaxBytes,
 		"metrics_plain_addr", cfg.MetricsPlainAddr,
 	)
 	return srv.Serve(ctx)

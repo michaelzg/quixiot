@@ -76,7 +76,7 @@ func (p Publisher) publishTelemetry() error {
 	if err := p.Session.PublishDatagram(p.TelemetryTopic, payload[:p.PayloadSize]); err != nil {
 		return fmt.Errorf("publisher: telemetry datagram: %w", err)
 	}
-	p.logger().Info("published telemetry", "topic", p.TelemetryTopic, "bytes", len(payload[:p.PayloadSize]))
+	p.logger().Debug("published telemetry", "topic", p.TelemetryTopic, "bytes", len(payload[:p.PayloadSize]))
 	return nil
 }
 
@@ -85,7 +85,7 @@ func (p Publisher) publishCommand(ctx context.Context) error {
 	if err := p.Session.PublishStream(ctx, p.CommandTopic, payload); err != nil {
 		return fmt.Errorf("publisher: command stream: %w", err)
 	}
-	p.logger().Info("published command", "topic", p.CommandTopic, "bytes", len(payload))
+	p.logger().Debug("published command", "topic", p.CommandTopic, "bytes", len(payload))
 	return nil
 }
 

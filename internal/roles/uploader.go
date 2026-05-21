@@ -67,7 +67,7 @@ func (u Uploader) UploadOnce(ctx context.Context, seq int64) error {
 	if err != nil {
 		return fmt.Errorf("uploader: upload %s: %w", name, err)
 	}
-	u.logger().Info("upload complete",
+	u.logger().Debug("upload complete",
 		"client_id", u.ClientID,
 		"name", name,
 		"bytes", resp.Bytes,

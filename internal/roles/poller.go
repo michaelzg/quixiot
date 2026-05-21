@@ -65,7 +65,7 @@ func (p Poller) PollOnce(ctx context.Context) error {
 		return fmt.Errorf("poller: get config: %w", err)
 	}
 
-	p.logger().Info("poll snapshot",
+	p.logger().Debug("poll snapshot",
 		"client_id", p.ClientID,
 		"server_version", state.Version,
 		"uptime_millis", state.UptimeMillis,
