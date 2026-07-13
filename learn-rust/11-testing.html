@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing, clippy, fmt — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="current" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 11</span>
+<h1>Testing, clippy, fmt</h1>
+
+<p class="lede">Tests in this crate live next to the code they exercise, run in seconds, and
+&mdash; per war story #4 &mdash; caught a real concurrency bug that live traffic had been
+quietly masking. This chapter is about how they're built to do that reliably.</p>
+
+<h2>Inline unit tests</h2>
+<p><code>#[cfg(test)] mod tests</code> at the bottom of a file compiles a nested module only
+when running tests &mdash; zero footprint in a release binary. Inside it, <code>#[test]</code>
+marks a function as a test case, and the standard <code>assert!</code>/<code>assert_eq!</code>
+macros take an optional trailing format-string argument for a custom failure message, the same
+<code>format_args!</code> machinery from chapter 10. A deterministic strategy test:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/strategy.rs — round_robin_cycles</div>
+  <pre><code>#[test]
+fn round_robin_cycles() {
+    let backends = vec![backend(1), backend(2), backend(3)];
+    let sel = Selector::new(Strategy::RoundRobin, 1);
+    let picks: Vec&lt;_&gt; = (0..6)
+        .map(|_| sel.select(&amp;backends, ip()).unwrap().addr().port())
+        .collect();
+    assert_eq!(picks, vec![1, 2, 3, 1, 2, 3]);
+}</code></pre>
+</div>
+<p>An error-path test using <code>unwrap_err</code> (the trait-bound war story from chapter 6
+is what makes this even compile):</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — rejects_duplicate_backends</div>
+  <pre><code>#[test]
+fn rejects_duplicate_backends() {
+    let err = parse(args(&amp;["--backends", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:1"])).unwrap_err();
+    assert!(err.contains("more than once"), "got: {err}");
+}</code></pre>
+</div>
+<p>and a parser-safety test feeding deliberately truncated bytes into
+<code>quic::parse_header</code>, already shown in full in chapter 10.</p>
+
+<h2>Async tests with real sockets, no mocks</h2>
+<p><code>#[tokio::test]</code> is <code>#[test]</code>'s async sibling: it spins up a tokio
+runtime around the test body so you can write <code>async fn</code> tests directly and
+<code>.await</code> inside them:</p>
+<pre><code>#[tokio::test]
+async fn sticky_sessions_and_round_robin_distribution() {</code></pre>
+<p>The balancer's integration tests don't mock the network at all &mdash; they spin up real
+UDP sockets bound to port 0 (the OS picks a free ephemeral port) as stand-in backends, tag
+every reply so the test can tell which backend answered, and drive real traffic through a
+real <code>Balancer</code>:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — spawn_tagged_echo</div>
+  <pre><code>async fn spawn_tagged_echo(tag: u8) -&gt; SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&amp;mut buf).await else {
+                return;
+            };
+            let mut reply = Vec::with_capacity(n + 1);
+            reply.push(tag);
+            reply.extend_from_slice(&amp;buf[..n]);
+            let _ = sock.send_to(&amp;reply, peer).await;
+        }
+    });
+    addr
+}</code></pre>
+</div>
+<p>This is a deliberate trade: real sockets are slightly slower than a mock and mean the tests
+touch the loopback network stack, but they exercise the actual code path war story #4 broke
+&mdash; a mock upstream socket would never have reproduced a tokio reactor readiness-caching
+bug, because the bug lived in the real I/O layer the mock would have replaced.</p>
+
+<h2>Determinism without sleeps</h2>
+<p>Tests that talk to real sockets need real discipline to stay non-flaky. Three tactics recur
+throughout this suite. <strong>Bounded timeouts</strong> instead of assuming a reply arrives:</p>
+<pre><code>let (n, _) = timeout(Duration::from_secs(2), client.recv_from(&amp;mut buf))</code></pre>
+<p><strong>Polling with a deadline</strong> instead of a fixed sleep, when a test needs to wait
+for an async side effect (a metric to update) rather than a direct reply:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — rejects_new_sessions_when_pool_is_down</div>
+  <pre><code>let deadline = Instant::now() + Duration::from_secs(2);
+loop {
+    if h.metrics.sessions_rejected.load(Ordering::Relaxed) &gt;= 2 {
+        break;
+    }
+    assert!(Instant::now() &lt; deadline, "rejections never counted");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}</code></pre>
+</div>
+<p>A fixed <code>sleep(500ms)</code> here would either waste time when the assertion is true
+almost immediately, or flake under load when it isn't true quite that fast &mdash; polling
+with a deadline is fast in the common case and still reliably fails within a bounded time in
+the broken case. And <strong>tagged replies</strong> &mdash; each fake backend prefixes every
+reply with a distinguishing byte (<code>spawn_tagged_echo</code>, above) &mdash; let a test
+assert exactly which backend a session landed on without needing separate sockets or ports to
+tell them apart by address alone.</p>
+
+<h2>Test-driven bug discovery, reprised</h2>
+<p>Chapter 9 told the try_send readiness story in full: the bug was invisible in the
+<code>make lb-demo</code> live-traffic scenario, because real QUIC clients retransmit an
+unanswered Initial packet and the dropped-first-packet symptom silently healed itself. It
+surfaced instead as a hard, reproducible integration-test failure &mdash; a bounded timeout
+with no retransmission logic to mask the drop. That's the general shape of why these tests
+exist in this form: demos show you the happy path working; deterministic, no-retry tests show
+you the edge the happy path was quietly stepping around.</p>
+
+<h2>Tooling culture: clippy and fmt</h2>
+<p><code>cargo clippy</code> is a much deeper lint pass than the compiler's own warnings
+&mdash; categories like redundant clones, manual loops that could be an iterator adapter, or
+needless returns. This crate is clippy-clean; running it as part of your workflow (many teams
+wire it into CI) catches these before they're habits. <code>cargo fmt</code> applies one
+canonical formatting with no configuration knobs worth arguing about &mdash; the Rust
+equivalent of <code>gofmt</code>, and for the same reason: mechanical style is a solved
+problem, and a formatter is cheaper than a code-review comment thread about brace placement.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>Run <code>cargo clippy --all-targets</code> and <code>cargo fmt --check</code> inside <code>lb/</code> (via <code>make lb-test</code> or directly) and confirm both are clean. Then introduce one obvious clippy target &mdash; e.g. add a <code>.clone()</code> immediately before a value's last use, or write a manual <code>for i in 0..v.len() {{ ... v[i] ... }}</code> loop somewhere &mdash; and see which lint fires. Revert before moving on.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="10-parsing-macros.html"><span class="label">Previous</span><span class="chapter-nav-title">Parsing bytes and macro_rules!</span></a><a class="next" href="12-rust-vs-go.html"><span class="label">Next</span><span class="chapter-nav-title">Rust vs Go retrospective</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

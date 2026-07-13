@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learn Rust from a working load balancer — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="current" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Guide</span>
+<h1>Learn Rust from a working load balancer</h1>
+
+<p class="lede">This is a Rust course where every example is production-shaped code pulled
+directly from <code>lb/</code> in this repository &mdash; <code>quixiot-lb</code>, an L4 (UDP)
+load balancer that fronts one or more QuixIoT QUIC/HTTP3 servers. You will not see a single
+snippet invented for the tutorial. If a chapter shows you code, you can open the named file
+and find it verbatim.</p>
+
+<p>You already know how to build software: you've shipped Go, you think in goroutines and
+channels, you don't need functions or hash maps explained to you. This guide skips that and
+goes straight at what's actually different about Rust &mdash; mostly the compiler's opinions
+about ownership, and what those opinions buy you.</p>
+
+<h2>What quixiot-lb does</h2>
+<p><code>quixiot-lb</code> sits between clients and a pool of backend QUIC servers. The first
+UDP datagram from a new client address picks a backend (via a pluggable strategy), opens a
+dedicated upstream socket to it, and every later datagram from that client reuses the same
+session &mdash; which is what keeps a QUIC connection's packets landing on one backend, a hard
+requirement since a different backend has no idea about that connection. An idle sweeper
+evicts sessions that go quiet, and a Prometheus endpoint exposes the same metric families the
+rest of this repo uses.</p>
+
+<div class="topology">
+  <div class="topo-col">
+    <div class="topo-box">clients<span>(QUIC/HTTP3)</span></div>
+  </div>
+  <div class="topo-arrow">── UDP ──▸</div>
+  <div class="topo-col">
+    <div class="topo-box lb">quixiot-lb<span>:4450</span></div>
+    <div class="topo-metrics">/metrics :9106</div>
+  </div>
+  <div class="topo-arrow">───▸</div>
+  <div class="topo-backends">
+    <div class="topo-box">server :4444</div>
+    <div class="topo-box">server :4445</div>
+    <div class="topo-box">server :4446</div>
+  </div>
+</div>
+
+<p>It deliberately mirrors the Go impairment proxy in
+<code>internal/proxy/proxy.go</code>: same session-per-client forwarding model, same buffer
+sizing, same two-sided health checking &mdash; different language, different concurrency
+primitives. That makes the two worth reading side by side, and this guide does exactly that
+throughout, especially in chapters 3, 8, and 9.</p>
+
+<h2>How to use this guide</h2>
+<ul>
+<li>Read the chapters in order &mdash; each one leans on vocabulary from the last.</li>
+<li>Run <code>make lb-test</code> to execute the crate's real test suite, and
+<code>make lb-demo</code> to watch three servers, the load balancer, and failover/recovery
+happen live. Nothing here is theoretical.</li>
+<li>Every chapter ends with one <strong>Try it</strong> exercise against the real crate in
+<code>lb/</code>. Do them in a scratch branch; several ask you to (temporarily) break
+something to see the compiler or a test catch it.</li>
+<li>Four callout types recur throughout: <strong>Go contrast</strong> (how you'd have written
+this in Go), <strong>Gotcha</strong> (a sharp edge worth knowing about early),
+<strong>War story</strong> (a real compiler error hit while building this crate, with the
+diagnosis and fix), and <strong>Try it</strong> (the exercise).</li>
+</ul>
+
+<h2>Codebase map</h2>
+<p>Ten source files, none longer than a few hundred lines. This table is your index back into
+<code>lb/src/</code> as you read.</p>
+<div class="table-wrap"><table><thead><tr><th>File</th><th>Role</th><th>Chapters</th></tr></thead><tbody><tr><td><code>main.rs</code></td><td>Wiring: parse config, bind the listen socket, spawn balancer/health/metrics, handle signals.</td><td>1, 9</td></tr><tr><td><code>config.rs</code></td><td>Hand-rolled CLI parser &rarr; <code>Config</code>, entirely by <code>Result</code> and <code>?</code>.</td><td>2, 4, 5, 6</td></tr><tr><td><code>strategy.rs</code></td><td><code>Strategy</code> enum plus <code>Selector</code>: round-robin, least-conn, random, ip-hash.</td><td>4, 7, 8</td></tr><tr><td><code>backend.rs</code></td><td>One upstream server's shared, atomic live state.</td><td>6, 8</td></tr><tr><td><code>balancer.rs</code></td><td>The forwarding core: listen socket, session table, return tasks, idle sweeper.</td><td>3, 7, 8, 9</td></tr><tr><td><code>health.rs</code></td><td>Active QUIC Version-Negotiation probes, one reused socket per backend.</td><td>9</td></tr><tr><td><code>net.rs</code></td><td>UDP socket construction with sized kernel buffers via <code>socket2</code>.</td><td>2, 3, 5</td></tr><tr><td><code>quic.rs</code></td><td>Bounds-checked QUIC header parsing, zero <code>unsafe</code>.</td><td>2, 4, 9, 10</td></tr><tr><td><code>metrics.rs</code></td><td>Atomic counters, hand-written Prometheus text exposition, tiny HTTP endpoint.</td><td>6, 7</td></tr><tr><td><code>log.rs</code></td><td>Minimal leveled logger with no <code>log</code>/<code>tracing</code>/<code>chrono</code> dependency.</td><td>2, 10</td></tr></tbody></table></div>
+
+<h2>Table of contents</h2>
+<div class="toc-grid">
+<div class="toc-entry"><div class="toc-num">01</div><div class="toc-body"><a href="01-toolchain.html">Cargo and the anatomy of a crate</a><p>The toolchain, Cargo.toml anatomy, and how modules replace Go's package-per-directory.</p></div></div>
+<div class="toc-entry"><div class="toc-num">02</div><div class="toc-body"><a href="02-fundamentals.html">Bindings, types, expressions</a><p>let, mut, inference, expression-oriented control flow, and the war story that teaches you to read a type error.</p></div></div>
+<div class="toc-entry"><div class="toc-num">03</div><div class="toc-body"><a href="03-ownership.html">Ownership, moves, borrowing</a><p>The chapter that makes Rust Rust: one owner, moves, borrowing, slices, and just enough lifetimes.</p></div></div>
+<div class="toc-entry"><div class="toc-num">04</div><div class="toc-body"><a href="04-enums-matching.html">Enums, match, Option</a><p>Tagged unions done right, exhaustiveness as a refactoring tool, and why this crate has no null.</p></div></div>
+<div class="toc-entry"><div class="toc-num">05</div><div class="toc-body"><a href="05-errors.html">Result and the ? operator</a><p>Errors as values, tracing one real ? chain end to end, and when unwrap is a smell versus a certainty.</p></div></div>
+<div class="toc-entry"><div class="toc-num">06</div><div class="toc-body"><a href="06-structs-traits.html">Structs, impl, traits, derive</a><p>Backend as a tour of structs and methods, traits as compile-time interfaces, and a derive-shaped war story.</p></div></div>
+<div class="toc-entry"><div class="toc-num">07</div><div class="toc-body"><a href="07-collections-iterators.html">Vec, HashMap, iterators</a><p>The session table, lazy iterator chains, turbofish, and building strings without per-line allocation.</p></div></div>
+<div class="toc-entry"><div class="toc-num">08</div><div class="toc-body"><a href="08-concurrency.html">Fearless concurrency</a><p>Send/Sync auto-derivation, Arc, Mutex discipline around .await, atomics, and exactly-once teardown.</p></div></div>
+<div class="toc-entry"><div class="toc-num">09</div><div class="toc-body"><a href="09-async.html">Async with tokio</a><p>Tasks versus goroutines, select!, Notify's permit semantics, and the try_send readiness bug, told in full.</p></div></div>
+<div class="toc-entry"><div class="toc-num">10</div><div class="toc-body"><a href="10-parsing-macros.html">Parsing bytes and macro_rules!</a><p>Untrusted-byte parsing with zero unsafe, and why logging needs a macro, not a function.</p></div></div>
+<div class="toc-entry"><div class="toc-num">11</div><div class="toc-body"><a href="11-testing.html">Testing, clippy, fmt</a><p>Inline unit tests, real-socket async integration tests, and the tooling culture that keeps this crate boring.</p></div></div>
+<div class="toc-entry"><div class="toc-num">12</div><div class="toc-body"><a href="12-rust-vs-go.html">Rust vs Go retrospective</a><p>A concept-by-concept table, an honest scorecard both ways, and concrete exercises against this crate.</p></div></div>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="next" href="01-toolchain.html"><span class="label">Next</span><span class="chapter-nav-title">Cargo and the anatomy of a crate</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>
