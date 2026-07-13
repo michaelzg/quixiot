@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enums, match, Option — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="current" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 04</span>
+<h1>Enums, match, Option</h1>
+
+<p class="lede">Rust's <code>enum</code> is a tagged union: each variant can carry its own
+data, the compiler always knows which variant a value is, and <code>match</code> is the tool
+for acting on that &mdash; with a guarantee Go's <code>switch</code> doesn't make.</p>
+
+<h2>Enums with data</h2>
+<p>A plain, C-like enum &mdash; no payload, just a closed set of named values &mdash;
+looks like <code>Strategy</code>:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/strategy.rs — Strategy</div>
+  <pre><code>#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strategy {
+    RoundRobin,
+    LeastConnections,
+    Random,
+    IpHash,
+}</code></pre>
+</div>
+<p>A richer enum can give each variant its own shape. QUIC's packet header is either a short
+form with no extractable fields, or a long form carrying a version, an optional packet type,
+and a connection ID &mdash; so <code>Header</code> is one enum with one unit-like variant and
+one struct-like variant:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/quic.rs — Header</div>
+  <pre><code>#[derive(Debug, PartialEq, Eq)]
+pub enum Header {
+    /// Short header (1-RTT). The DCID length is implicit on the wire, so we
+    /// can't extract it here — we only note the form.
+    Short,
+    Long {
+        version: u32,
+        packet_type: Option&lt;LongPacketType&gt;,
+        dcid: Vec&lt;u8&gt;,
+    },
+}</code></pre>
+</div>
+<p>There's no equivalent single-type representation in Go: you'd reach for an interface with
+two implementing structs, or a struct with a discriminant field and a pile of fields that are
+only valid for some discriminants (and nothing stops you from reading them when they aren't).
+<code>Header</code> makes invalid states unrepresentable &mdash; a <code>Header::Short</code>
+value has no <code>dcid</code> field to accidentally read, because that field doesn't exist on
+that variant.</p>
+
+<h2>match: exhaustiveness as a refactoring superpower</h2>
+<p><code>match</code> requires you to handle every variant (or an explicit <code>_</code>
+wildcard). This isn't just a style nicety &mdash; it's a compile error, and that turns "add a
+new variant" into a checklist the compiler runs for you. <code>Selector::select</code> matches
+on <code>self.strategy</code>:</p>
+<pre><code>pub fn select(&amp;self, backends: &amp;[Arc&lt;Backend&gt;], client: IpAddr) -&gt; Option&lt;Arc&lt;Backend&gt;&gt; {</code></pre>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/strategy.rs — Selector::select</div>
+  <pre><code>let chosen = match self.strategy {
+    Strategy::RoundRobin =&gt; {
+        // fetch_add wraps; modulo maps it onto the healthy subset. Note
+        // the cursor counts *attempts*, not backends, so as backends flap
+        // healthy/unhealthy the distribution stays roughly even.
+        let n = self.rr_cursor.fetch_add(1, Ordering::Relaxed);
+        healthy[n % healthy.len()]
+    }
+    Strategy::LeastConnections =&gt; healthy
+        .iter()
+        .min_by_key(|b| b.active_sessions())
+        .copied()
+        .expect("healthy is non-empty"),
+    Strategy::Random =&gt; {
+        let r = self.next_rand() as usize;
+        healthy[r % healthy.len()]
+    }
+    Strategy::IpHash =&gt; {
+        // Deterministic per client IP: the same device maps to the same
+        // backend as long as that backend stays healthy.
+        let h = hash_ip(client) as usize;
+        healthy[h % healthy.len()]
+    }
+};</code></pre>
+</div>
+<p>Add a fifth <code>Strategy</code> variant (chapter 12's weighted-strategy exercise asks you
+to) and this <code>match</code>, <code>Strategy::label</code>'s <code>match</code>, and
+<code>Strategy::parse</code>'s all stop compiling until you handle the new case everywhere.
+Nothing silently falls through to a default; nothing ships half-implemented.</p>
+
+<h2>Option&lt;T&gt;: no null</h2>
+<p>There is no null pointer, no nil interface value, and no reference type in Rust that can
+secretly be absent. "This might not have a value" is instead a real type,
+<code>Option&lt;T&gt;</code>, with two variants: <code>Some(T)</code> and <code>None</code>.
+<code>Selector::select</code>'s signature says exactly this &mdash; it returns
+<code>Option&lt;Arc&lt;Backend&gt;&gt;</code>, and "every backend is currently unhealthy" is a
+real, typed outcome (the <code>None</code> case), not a null the caller can forget to check
+and panic on three call frames later. The caller in <code>balancer.rs::get_or_create</code> is
+forced by the type system to handle it:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::get_or_create</div>
+  <pre><code>// Choose a backend and open the upstream socket *before* taking the lock
+// again, so the await points don't hold the mutex across .await.
+let backend = match self.selector.select(&amp;self.backends, client.ip()) {
+    Some(b) =&gt; b,
+    None =&gt; {
+        self.metrics.session_rejected();
+        // swap returns the previous value, so exactly one caller wins
+        // the edge and warns; the rest stay at debug until recovery.
+        if !self.pool_down_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "no healthy backend for new client {client}; dropping packets \
+                 (suppressing further warnings until the pool recovers)"
+            );
+        } else {
+            debug!("no healthy backend for new client {client}; dropping packet");
+        }
+        return None;
+    }
+};</code></pre>
+</div>
+<p>There's no path through this function that silently treats an empty pool as a valid
+backend &mdash; the compiler won't let <code>backend</code> be used past this point unless
+this <code>match</code> has proven it's the <code>Some</code> case.</p>
+
+<div class="callout callout-go">
+  <span class="callout-label">Go contrast</span>
+  <p>Go's <code>nil</code> can hide inside almost any type &mdash; a pointer, a map, a slice, an interface &mdash; and the type system gives you no help remembering to check for it; a forgotten nil check is a runtime panic, discovered in production if you're unlucky. The <code>ok</code> idiom (<code>v, ok := m[k]</code>) is the closest analogue to <code>Option</code>, but it's a convention, not enforced &mdash; you can ignore <code>ok</code> and use a zero-valued <code>v</code> and the compiler says nothing. Go's <code>switch</code> on a type or a closed set of constants also has no exhaustiveness check: add a new case and every <code>switch</code> that should handle it keeps compiling, silently falling into whatever <code>default</code> (or nothing) was already there.</p>
+</div>
+
+<h2>Patterns beyond match</h2>
+<p><code>if let PATTERN = value { }</code> handles one variant without a full
+<code>match</code>. <code>let ... else</code> (stabilized more recently) is its mirror image:
+match a pattern, or diverge (<code>return</code>/<code>break</code>/<code>continue</code>/<code>panic!</code>)
+in the <code>else</code> branch, and the matched bindings stay in scope for the rest of the
+function. A test helper in the balancer suite uses exactly this to bail out of an echo-server
+loop when its socket closes:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — spawn_tagged_echo</div>
+  <pre><code>let Ok((n, peer)) = sock.recv_from(&amp;mut buf).await else {
+    return;
+};</code></pre>
+</div>
+<p><code>while let</code> is the loop form of <code>if let</code>: keep looping as long as the
+pattern keeps matching. The flag-parsing loop in <code>config.rs</code> is a <code>while let</code>
+over the argument iterator:</p>
+<pre><code>while let Some(flag) = it.next() {</code></pre>
+<p>and the <code>matches!</code> macro is a boolean one-liner for "does this value match this
+pattern," useful when you only care about yes/no:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/quic.rs — Header::is_initial</div>
+  <pre><code>pub fn is_initial(&amp;self) -&gt; bool {
+    matches!(
+        self,
+        Header::Long {
+            packet_type: Some(LongPacketType::Initial),
+            ..
+        }
+    )
+}</code></pre>
+</div>
+<p>The <code>..</code> inside the pattern means "ignore the rest of this variant's fields"
+&mdash; here, ignore <code>version</code> and <code>dcid</code>, only <code>packet_type</code>
+matters for this check.</p>
+
+<h2>Option and Result combinators</h2>
+<p>Rather than unwrapping and re-wrapping by hand, <code>Option</code>/<code>Result</code>
+have chainable methods. <code>parse_addr</code> uses three in five lines:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — parse_addr</div>
+  <pre><code>fn parse_addr(s: &amp;str) -&gt; Result&lt;SocketAddr, String&gt; {
+    s.to_socket_addrs()
+        .map_err(|e| format!("bad address {s:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("address {s:?} resolved to nothing"))
+}</code></pre>
+</div>
+<p><code>.map_err(...)</code> transforms an <code>Err</code>'s payload (a std
+<code>io::Error</code>) into this crate's error type (<code>String</code>) without touching
+an <code>Ok</code>. <code>.next()</code> on the resulting iterator of resolved addresses
+returns an <code>Option</code> (the standard iterator method, reused here instead of a
+special-cased "get first" function). <code>.ok_or_else(...)</code> converts that
+<code>Option</code>'s <code>None</code> case into an <code>Err</code> with a lazily-built
+message &mdash; the closure only runs if it's actually needed. Chapter 5 covers
+<code>Result</code> and <code>?</code> properly; the combinators are worth recognizing now
+because they show up constantly wherever this crate touches an <code>Option</code>.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/strategy.rs</code>, add a fifth line to the <code>Strategy</code> enum &mdash; say <code>Weighted</code> &mdash; and run <code>cargo build</code> inside <code>lb/</code> without changing anything else. Read every <code>non-exhaustive patterns</code> error the compiler produces and note which functions it points you at (<code>Strategy::label</code>, <code>Strategy::parse</code>, <code>Selector::select</code>). This is the exhaustiveness check working exactly as designed &mdash; and the beginning of the weighted-strategy exercise in chapter 12.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="03-ownership.html"><span class="label">Previous</span><span class="chapter-nav-title">Ownership, moves, borrowing</span></a><a class="next" href="05-errors.html"><span class="label">Next</span><span class="chapter-nav-title">Result and the ? operator</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

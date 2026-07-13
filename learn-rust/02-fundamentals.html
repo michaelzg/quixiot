@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bindings, types, expressions — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="current" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 02</span>
+<h1>Bindings, types, expressions</h1>
+
+<p class="lede">This chapter covers the parts of Rust that feel closest to what you already
+know &mdash; bindings, scalars, control flow, functions &mdash; while flagging the handful of
+places Rust insists on more precision than Go does. Ownership, the actually novel part, is
+next chapter.</p>
+
+<h2>Bindings: let, mut, shadowing</h2>
+<p><code>let</code> introduces a binding that is <strong>immutable by default</strong> &mdash;
+the opposite default from Go's <code>var</code>/<code>:=</code>. You opt into mutability
+explicitly with <code>let mut</code>. This shows up constantly in
+<code>config.rs::parse</code>, which builds up a <code>Config</code> from defaults that
+individual flags then override:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — parse</div>
+  <pre><code>let mut listen = Config::default_listen();
+let mut backends_raw: Option&lt;String&gt; = None;
+let mut strategy = Strategy::RoundRobin;
+let mut metrics_addr: Option&lt;SocketAddr&gt; = Some("127.0.0.1:9106".parse().unwrap());
+let mut idle_timeout = Duration::from_secs(300);
+let mut health_active = true;
+let mut health_interval = Duration::from_secs(2);
+let mut health_timeout = Duration::from_millis(500);
+let mut health_fail_threshold: u32 = 2;
+let mut log_level = Level::Info;</code></pre>
+</div>
+<p>Every one of those needs <code>mut</code> because the flag-parsing loop that follows
+reassigns them as it consumes <code>--listen</code>, <code>--backends</code>, and so on.
+Bindings that never change &mdash; the vast majority in most Rust code &mdash; don't get the
+keyword, and the compiler warns if you wrote <code>mut</code> on something you never actually
+mutate. That's a cheap, continuous correctness signal Go's <code>var</code> can't give you.</p>
+
+<p>Rust also permits <strong>shadowing</strong>: rebinding the same name with a new
+<code>let</code>, which introduces a genuinely new binding (possibly a new type) rather than
+mutating the old one. It's common for "parse this string into a stricter type under the same
+name" idioms; worth recognizing as distinct from <code>mut</code> when you see it in other
+Rust code.</p>
+
+<h2>Type inference, and when it needs an anchor</h2>
+<p>Rust infers types locally from usage, so most bindings need no annotation. But inference
+works forward from a value and backward from how it's used &mdash; and when neither side pins
+down a concrete type, the compiler stops and asks.</p>
+
+<div class="callout callout-warstory">
+  <span class="callout-label">War story: inference needs an anchor</span>
+  <p>While writing the QUIC header parser, this line looked obviously fine:</p><div class="snippet">
+  <div class="snippet-caption not-compiling">lb/src/quic.rs — before</div>
+  <pre><code>let dcid_len = *datagram.get(5)? as usize;
+let dcid_start = 6;
+let dcid_end = dcid_start.checked_add(dcid_len)?;</code></pre>
+</div><p>and it failed with:</p><pre><code>error[E0689]: can't call method `checked_add` on ambiguous numeric type `{integer}`</code></pre><p><strong>Diagnosis:</strong> a bare integer literal like <code>6</code> doesn't have a type yet &mdash; Rust picks a default (<code>i32</code>) only when nothing else constrains it, and <code>usize::checked_add</code> needs to know it's operating on a <code>usize</code> specifically, so the literal's type stayed ambiguous right up to the method call. <strong>Fix:</strong> anchor it with an explicit annotation:</p><div class="snippet">
+  <div class="snippet-caption">lb/src/quic.rs — parse_header</div>
+  <pre><code>let dcid_len = *datagram.get(5)? as usize;
+let dcid_start: usize = 6;
+let dcid_end = dcid_start.checked_add(dcid_len)?;</code></pre>
+</div><p><strong>Lesson:</strong> when Rust can't infer a numeric type, it doesn't guess wrong silently the way an untyped Go constant might convert unexpectedly at a boundary &mdash; it stops and makes you say what you meant, once, at the point of ambiguity.</p>
+</div>
+
+<h2>Scalar types and casts</h2>
+<p>The integer types are explicit about width and signedness: <code>u8</code>&hellip;<code>u64</code>,
+<code>u128</code>, signed <code>i8</code>&hellip;<code>i128</code>, and the pointer-sized
+<code>usize</code>/<code>isize</code> used for indexing and lengths (Go's <code>int</code>
+plays that role implicitly; Rust makes you pick). There's no implicit numeric conversion
+anywhere, even between <code>u32</code> and <code>u64</code> &mdash; you convert explicitly
+with <code>as</code>, which truncates or extends without panicking:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/strategy.rs — Selector::select</div>
+  <pre><code>Strategy::Random =&gt; {
+    let r = self.next_rand() as usize;
+    healthy[r % healthy.len()]
+}</code></pre>
+</div>
+<p><code>next_rand()</code> returns a <code>u64</code>; <code>as usize</code> truncates it to
+the platform's pointer width before it's used to index the healthy-backend slice via modulo.
+Casts are a place bugs like to hide (silent truncation), so they're a good place to slow down
+when reading unfamiliar Rust.</p>
+
+<p>Fixed-size arrays and growable <code>Vec</code>s are distinct types &mdash; an array's
+length is part of its type. A probe packet is always exactly <code>PROBE_LEN</code> bytes, so
+it's an array:</p>
+<pre><code>let mut pkt = [0u8; PROBE_LEN];</code></pre>
+<p>while a per-datagram scratch buffer sized from a runtime constant is a <code>Vec</code>:</p>
+<pre><code>let mut buf = vec![0u8; MAX_DATAGRAM];</code></pre>
+<p><code>String</code> (owned, growable, heap-allocated) versus <code>&amp;str</code>
+(a borrowed view into UTF-8 text, no allocation) is the same distinction as <code>Vec</code>
+vs. a slice, specialized to text. <code>Backend</code> owns its label as a <code>String</code>
+but exposes it as <code>&amp;str</code>:</p>
+<pre><code>label: String,</code></pre>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — Backend::label</div>
+  <pre><code>pub fn label(&amp;self) -&gt; &amp;str {
+    &amp;self.label
+}</code></pre>
+</div>
+<p>Chapter 3 covers exactly why the getter can hand out a borrowed <code>&amp;str</code> here
+without copying the string or fighting the borrow checker.</p>
+
+<h2>Expressions vs. statements</h2>
+<p>In Rust, blocks are expressions: the last line without a semicolon is the block's value.
+That makes <code>if</code>/<code>else</code> usable as an expression directly, not just a
+control-flow statement &mdash; both arms must produce the same type:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/net.rs — wildcard_for</div>
+  <pre><code>pub fn wildcard_for(peer: SocketAddr) -&gt; SocketAddr {
+    if peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    }
+}</code></pre>
+</div>
+<p>Both branches are single-expression blocks (a string literal parsed to a
+<code>SocketAddr</code>); the whole <code>if</code>/<code>else</code> is itself the function's
+return value, with no explicit <code>return</code> needed. <code>match</code> works the same
+way as an expression:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/log.rs — Level::label</div>
+  <pre><code>fn label(self) -&gt; &amp;'static str {
+    match self {
+        Level::Debug =&gt; "DEBUG",
+        Level::Info =&gt; "INFO",
+        Level::Warn =&gt; "WARN",
+        Level::Error =&gt; "ERROR",
+    }
+}</code></pre>
+</div>
+<p>Every arm evaluates to a <code>&amp;'static str</code>, so the whole <code>match</code>
+evaluates to one, and that's what the function returns. You'll see this pattern &mdash;
+"the function body is one big expression" &mdash; constantly in idiomatic Rust; get comfortable
+reading a <code>match</code> or <code>if</code> as a value-producing expression, not a jump
+table.</p>
+
+<h2>Functions and closures</h2>
+<p><code>fn name(params) -&gt; ReturnType { ... }</code>; as above, the last expression
+(no semicolon) is the return value &mdash; an explicit <code>return</code> is only needed for
+an early return. Closures are anonymous functions that can capture their environment, written
+with <code>|params| body</code>. <code>config.rs::parse</code> defines one inside its
+flag-parsing loop:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — parse</div>
+  <pre><code>let mut value = || -&gt; Result&lt;String, String&gt; {
+    it.next()
+        .ok_or_else(|| format!("flag {flag} requires a value"))
+};</code></pre>
+</div>
+<p><code>value</code> captures <code>it</code> (the argument iterator) and <code>flag</code>
+(the current flag string) from the enclosing scope by reference, and is called as
+<code>value()?</code> wherever a flag needs its argument &mdash; e.g. <code>--listen</code>
+calls <code>parse_addr(&amp;value()?)?</code>. The comment above it in the source explains why
+it's a closure rather than a free function: a plain function can't capture <code>it</code> and
+<code>flag</code> from its caller's stack the way a closure can.</p>
+
+<h2>Loops and ranges</h2>
+<p><code>loop</code> is an unconditional loop (broken with <code>break</code>, optionally
+returning a value); <code>while cond { }</code> is a conditional loop; <code>for x in iter</code>
+consumes anything implementing <code>IntoIterator</code> &mdash; no C-style three-clause loop
+exists in Rust at all. A plain <code>while</code>, draining a socket's queued packets:</p>
+<pre><code>while sock.try_recv(&amp;mut buf).is_ok() {}</code></pre>
+<p>A <code>for</code> loop over a split-and-trim iterator, from backend-list parsing:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — parse_backends</div>
+  <pre><code>for token in raw.split(',') {
+    let token = token.trim();
+    if token.is_empty() {
+        continue;
+    }
+    out.push(parse_addr(token)?);
+}</code></pre>
+</div>
+<p>Ranges (<code>0..n</code>, exclusive of <code>n</code>; <code>0..=n</code> inclusive) are
+themselves iterators, so <code>for i in 0..6</code> or <code>(0..6).map(...)</code> both work
+&mdash; <code>strategy.rs</code>'s round-robin test drives six selections this way:
+<code>(0..6).map(|_| sel.select(&amp;backends, ip()).unwrap()...)</code>.</p>
+
+<h2>const and static</h2>
+<p><code>const</code> is a compile-time-inlined value with no fixed memory address &mdash;
+closest to Go's typed constants. <code>static</code> has one fixed address for the whole
+program's lifetime, which is what makes it usable for shared mutable state via atomics (a
+preview of chapter 8):</p>
+<pre><code>const PROBE_VERSION: u32 = 0x1a2a_3a4a;</code></pre>
+<pre><code>const MAX_DATAGRAM: usize = 64 * 1024;</code></pre>
+<pre><code>static MIN_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);</code></pre>
+<p><code>MIN_LEVEL</code> in <code>log.rs</code> is how the whole crate's log level is
+readable and writable from any thread without a lock &mdash; <code>log::set_level</code>
+stores into it, every <code>info!</code>/<code>warn!</code> call loads from it. More on why
+that's safe in chapter 8.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/quic.rs</code>, temporarily change <code>let dcid_start: usize = 6;</code> back to <code>let dcid_start = 6;</code> and run <code>cargo build</code> inside <code>lb/</code>. Read the <code>E0689</code> error the compiler gives you, then revert the change. Reproducing war story #1 yourself is the fastest way to recognize the shape of an inference error the next time you hit one.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="01-toolchain.html"><span class="label">Previous</span><span class="chapter-nav-title">Cargo and the anatomy of a crate</span></a><a class="next" href="03-ownership.html"><span class="label">Next</span><span class="chapter-nav-title">Ownership, moves, borrowing</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

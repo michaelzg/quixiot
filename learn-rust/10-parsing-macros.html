@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parsing bytes and macro_rules! — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="current" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 10</span>
+<h1>Parsing bytes and macro_rules!</h1>
+
+<p class="lede">Two unrelated-looking topics share a chapter because they're both about doing
+more with less machinery: parsing untrusted bytes with nothing but bounds-checked slice
+access, and generating repetitive code with <code>macro_rules!</code> instead of a code
+generator or a runtime reflection trick.</p>
+
+<h2>Parsing untrusted bytes without unsafe</h2>
+<p>This load balancer sticks sessions to the client's 4-tuple, so it never strictly needs to
+understand QUIC's wire format &mdash; but peeking at the header lets it count new connections
+for metrics, and the parser is a compact demonstration of a broader point: Rust can do
+untrusted, bounds-checked bit-parsing with <strong>zero <code>unsafe</code></strong> anywhere
+in the whole crate. Here's the whole function:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/quic.rs — parse_header</div>
+  <pre><code>pub fn parse_header(datagram: &amp;[u8]) -&gt; Option&lt;Header&gt; {
+    let first = *datagram.first()?;
+    let long = first &amp; 0x80 != 0;
+    if !long {
+        return Some(Header::Short);
+    }
+
+    // Long header: 1 byte + 4-byte version + length-prefixed DCID and SCID.
+    let version = u32::from_be_bytes(datagram.get(1..5)?.try_into().ok()?);
+
+    let dcid_len = *datagram.get(5)? as usize;
+    let dcid_start: usize = 6;
+    let dcid_end = dcid_start.checked_add(dcid_len)?;
+    let dcid = datagram.get(dcid_start..dcid_end)?.to_vec();
+
+    // Confirm the SCID length byte and bytes are actually present, so a truncated
+    // packet is rejected rather than reported as a valid long header.
+    let scid_len = *datagram.get(dcid_end)? as usize;
+    let scid_end = dcid_end.checked_add(1)?.checked_add(scid_len)?;
+    let _ = datagram.get(dcid_end + 1..scid_end)?;
+
+    let packet_type = if version == 0 {
+        None // Version Negotiation packet.
+    } else {
+        Some(match (first &amp; 0x30) &gt;&gt; 4 {
+            0x00 =&gt; LongPacketType::Initial,
+            0x01 =&gt; LongPacketType::ZeroRtt,
+            0x02 =&gt; LongPacketType::Handshake,
+            _ =&gt; LongPacketType::Retry,
+        })
+    };
+
+    Some(Header::Long {
+        version,
+        packet_type,
+        dcid,
+    })
+}</code></pre>
+</div>
+<p>Every single field read goes through <code>slice.get(range)?</code> rather than direct
+indexing (<code>slice[range]</code>, which panics on an out-of-range index). <code>get</code>
+returns an <code>Option</code>, and the <code>?</code> operator (chapter 5, here working on
+<code>Option</code> instead of <code>Result</code> &mdash; both support it) turns "the slice
+doesn't extend that far" into an immediate <code>return None</code>. A truncated or hostile
+datagram can never cause a panic or an out-of-bounds read; it just produces <code>None</code>,
+handled by the caller as "doesn't look like QUIC, forward it anyway":</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/quic.rs — truncated_long_header_is_none</div>
+  <pre><code>#[test]
+fn truncated_long_header_is_none() {
+    // Claims a 5-byte DCID but the packet ends early.
+    let pkt = [0xC0, 0x00, 0x00, 0x00, 0x01, 0x05, 0xAA];
+    assert_eq!(parse_header(&amp;pkt), None);
+}</code></pre>
+</div>
+<p>Fixed-width integer fields come out with <code>from_be_bytes</code> plus
+<code>try_into</code> to convert a variable-length slice into the fixed-size array the
+conversion needs:</p>
+<pre><code>let version = u32::from_be_bytes(datagram.get(1..5)?.try_into().ok()?);</code></pre>
+<p>and variable-length fields chain <code>checked_add</code> (chapter 2's inference war story)
+to compute the next offset without risking an integer overflow panic on hostile input:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/quic.rs — parse_header</div>
+  <pre><code>let dcid_len = *datagram.get(5)? as usize;
+let dcid_start: usize = 6;
+let dcid_end = dcid_start.checked_add(dcid_len)?;
+let dcid = datagram.get(dcid_start..dcid_end)?.to_vec();</code></pre>
+</div>
+<p>The bit-twiddling itself &mdash; <code>first &amp; 0x80</code>, <code>(first &amp; 0x30) &gt;&gt; 4</code>
+&mdash; reads exactly like the equivalent C or Go would. What's different is everything
+<em>around</em> it: there's no way to read past the end of <code>datagram</code>, full stop,
+regardless of how malformed the input is.</p>
+
+<h2>Declarative macros: why logging needs one</h2>
+<p>A logging call needs to accept a variable number of format arguments
+(<code>info!("backend {} recovered -&gt; {}", label, state)</code>) and, ideally, avoid
+paying the cost of formatting the message at all when that log level is disabled. Neither is
+possible with an ordinary function in Rust &mdash; functions have fixed arity, and arguments
+are evaluated before the call regardless of what the function does with them.
+<code>macro_rules!</code> solves both: it operates on the call's token stream before
+type-checking, so it can accept any number of arguments and expand into code that only
+formats when needed. <code>log.rs</code> defines the whole logging macro family in about
+twenty lines:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/log.rs — log_at! and friends</div>
+  <pre><code>#[macro_export]
+macro_rules! log_at {
+    ($lvl:expr, $($arg:tt)*) =&gt; {
+        $crate::log::emit($lvl, format_args!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) =&gt; { $crate::log_at!($crate::log::Level::Debug, $($arg)*) };
+}
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) =&gt; { $crate::log_at!($crate::log::Level::Info, $($arg)*) };
+}
+#[macro_export]
+macro_rules! warn {
+    ($($arg:tt)*) =&gt; { $crate::log_at!($crate::log::Level::Warn, $($arg)*) };
+}
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)*) =&gt; { $crate::log_at!($crate::log::Level::Error, $($arg)*) };
+}</code></pre>
+</div>
+<p><code>$($arg:tt)*</code> matches "zero or more arbitrary token trees" &mdash; the variadic
+part. Each level macro (<code>info!</code>, <code>warn!</code>, ...) just forwards its
+arguments to <code>log_at!</code> with its own <code>Level</code> spliced in, and
+<code>log_at!</code> forwards to <code>emit</code> via <code>format_args!</code>, which builds
+a lazily-formatted <code>Arguments</code> value rather than an eagerly-allocated
+<code>String</code> &mdash; the message is only actually rendered to text inside
+<code>emit</code>, after the level check has already passed. <code>#[macro_export]</code>
+makes the macro usable from other modules via <code>$crate::log_at!</code>, the macro
+equivalent of <code>pub</code>.</p>
+<p>You've now met several macros without necessarily clocking them as such:
+<code>#[derive(...)]</code> (chapter 6), <code>vec![...]</code> and <code>format!</code>
+(chapter 2), and <code>matches!</code> (chapter 4) are all macros too &mdash; some declarative
+like this one, some built into the compiler. Rust also has <em>procedural</em> macros (how
+<code>#[derive(Debug)]</code> itself is implemented, for instance) &mdash; out of scope here;
+recognizing that they exist is enough for reading this codebase.</p>
+
+<div class="callout callout-gotcha">
+  <span class="callout-label">Macros before modules</span>
+  <p>Order matters at the top of <code>main.rs</code>:</p><pre><code>#[macro_use]
+mod log;</code></pre><p><code>#[macro_use]</code> has to appear directly above the <code>mod log;</code> declaration, and <code>mod log;</code> has to come before any other module that wants to use <code>info!</code>/<code>warn!</code>/etc. without a fully-qualified <code>crate::log_at!</code> path. Macro visibility follows textual declaration order in a way ordinary item visibility (governed by <code>pub</code>, not position) does not &mdash; a sharp edge if you're used to import order never mattering.</p>
+</div>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/quic.rs</code>, change the truncated-packet test's byte array in <code>truncated_long_header_is_none</code> to include one extra trailing byte so the packet is no longer actually truncated, and predict whether the assertion should now expect <code>Some</code> or stay <code>None</code> before running <code>cargo test</code> to check yourself. This exercises exactly the boundary the <code>slice.get(range)?</code> pattern is built to guard.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="09-async.html"><span class="label">Previous</span><span class="chapter-nav-title">Async with tokio</span></a><a class="next" href="11-testing.html"><span class="label">Next</span><span class="chapter-nav-title">Testing, clippy, fmt</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

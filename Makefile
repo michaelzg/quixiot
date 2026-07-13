@@ -1,6 +1,11 @@
 GO ?= go
+CARGO ?= cargo
 BIN ?= ./bin
 CMDS := server client proxy fleet
+
+# Rust load balancer (see lb/README.md).
+LB_DIR ?= lb
+LB_BIN ?= $(LB_DIR)/target/release/quixiot-lb
 
 CERT_DIR ?= var/certs
 CA_FILE ?= $(CERT_DIR)/ca.pem
@@ -15,6 +20,11 @@ PROXY_LISTEN ?= 127.0.0.1:4443
 PROXY_UPSTREAM ?= 127.0.0.1:4444
 PROXY_METRICS_ADDR ?= 127.0.0.1:9104
 CLIENT_METRICS_ADDR ?= 127.0.0.1:9105
+
+LB_LISTEN ?= 127.0.0.1:4450
+LB_BACKENDS ?= 127.0.0.1:4444,127.0.0.1:4445,127.0.0.1:4446
+LB_STRATEGY ?= round-robin
+LB_METRICS_ADDR ?= 127.0.0.1:9106
 
 SERVER_URL ?= https://127.0.0.1:4443
 CLIENT_ID ?= client-local
@@ -47,7 +57,7 @@ GF_PORT ?= 3000
 PROM_RETENTION ?= 1d
 PROM_RETENTION_SIZE ?= 1GB
 
-.PHONY: all build $(CMDS) test vet fmt tidy clean help certs run-server run-proxy run-client run-fleet demo verify metrics grafana grafana-down grafana-logs grafana-status observability observability-down up down restart status logs
+.PHONY: all build $(CMDS) test vet fmt tidy clean help certs run-server run-proxy run-client run-fleet demo verify metrics grafana grafana-down grafana-logs grafana-status observability observability-down up down restart status logs lb lb-test lb-clean run-lb lb-demo
 
 all: build
 
@@ -114,6 +124,34 @@ run-fleet: fleet client certs
 		--metrics-host $(FLEET_METRICS_HOST) \
 		--targets-file $(FLEET_TARGETS_FILE) \
 		--log-level $(LOG_LEVEL)
+
+# --- Rust load balancer (lb/) ---
+
+# Build the release binary. cargo tracks its own inputs, so this is cheap when
+# nothing changed.
+lb:
+	$(CARGO) build --release --manifest-path $(LB_DIR)/Cargo.toml
+
+lb-test:
+	$(CARGO) test --manifest-path $(LB_DIR)/Cargo.toml
+
+lb-clean:
+	$(CARGO) clean --manifest-path $(LB_DIR)/Cargo.toml
+
+# Run the load balancer in front of LB_BACKENDS. Start the backends yourself
+# (e.g. several `make run-server` on different --addr), or use `make lb-demo`.
+run-lb: lb
+	$(LB_BIN) \
+		--listen $(LB_LISTEN) \
+		--backends $(LB_BACKENDS) \
+		--strategy $(LB_STRATEGY) \
+		--metrics-addr $(LB_METRICS_ADDR) \
+		--log-level $(LOG_LEVEL)
+
+# End-to-end demo: several servers behind the LB — traffic, distribution,
+# failover, and recovery of a restarted backend.
+lb-demo: lb server client certs
+	./scripts/lb-demo.sh
 
 demo: build certs
 	./scripts/demo.sh
@@ -277,6 +315,10 @@ help:
 	@echo "  certs            generate local CA and server leaf into $(CERT_DIR)/"
 	@echo "  run-server       run the HTTP/3 + WebTransport server (plain metrics on $(SERVER_METRICS_PLAIN_ADDR))"
 	@echo "  run-proxy        run the UDP impairment proxy (PROFILE=...)"
+	@echo "  lb               build the Rust load balancer into $(LB_BIN)"
+	@echo "  lb-test          run the load balancer unit tests"
+	@echo "  run-lb           run the load balancer (LB_BACKENDS=..., LB_STRATEGY=...)"
+	@echo "  lb-demo          demo: servers behind the LB — distribution, failover, recovery"
 	@echo "  run-client       run one simulated device (ROLE=...) through SERVER_URL"
 	@echo "  run-fleet        spawn COUNT simulated devices (ROLE defaults to mixed); writes $(FLEET_TARGETS_FILE)"
 	@echo "  demo             launch the tmux demo"

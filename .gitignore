@@ -21,6 +21,9 @@
 # Local build/test cache (used during sandboxed go runs)
 /.gocache/
 
+# Rust load balancer build output (Cargo.lock is tracked for the binary crate)
+/lb/target/
+
 # Editor/OS junk
 .DS_Store
 .idea/

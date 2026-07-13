@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vec, HashMap, iterators — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="current" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 07</span>
+<h1>Vec, HashMap, iterators</h1>
+
+<p class="lede"><code>Vec&lt;T&gt;</code> and <code>HashMap&lt;K, V&gt;</code> are the same
+tools they are in any language; what's different is that iteration in Rust is built on a lazy
+adapter chain rather than an imperative loop with manual index bookkeeping.</p>
+
+<h2>The session table: Vec and HashMap in the hot path</h2>
+<p>The balancer's core state is a map from client address to session, guarded by a mutex
+(chapter 8 covers the locking discipline; this chapter is about the collection itself):</p>
+<pre><code>sessions: Mutex&lt;HashMap&lt;SocketAddr, Arc&lt;Session&gt;&gt;&gt;,</code></pre>
+<p>Lookup on the fast path is a plain <code>HashMap::get</code>, cloning the <code>Arc</code>
+out and dropping the lock immediately:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::get_or_create</div>
+  <pre><code>async fn get_or_create(self: &amp;Arc&lt;Self&gt;, client: SocketAddr) -&gt; Option&lt;Arc&lt;Session&gt;&gt; {
+    // Fast path: existing session under a short lock.
+    if let Some(session) = self.sessions.lock().unwrap().get(&amp;client).cloned() {
+        return Some(session);
+    }</code></pre>
+</div>
+<p>and insertion on the slow path (after opening a new upstream socket) uses
+<code>HashMap::insert</code>, with a check for a session that raced ahead of this one:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::get_or_create</div>
+  <pre><code>// Insert, guarding against a racing datagram that created the same
+// session first: if we lost the race, drop ours and use theirs.
+{
+    let mut map = self.sessions.lock().unwrap();
+    if let Some(existing) = map.get(&amp;client).cloned() {
+        drop(map);
+        session.closed.store(true, Ordering::Relaxed); // ours never counted
+        return Some(existing);
+    }
+    map.insert(client, Arc::clone(&amp;session));
+}</code></pre>
+</div>
+
+<p><code>HashMap::retain</code> is the filter-in-place tool: keep entries matching a predicate,
+drop the rest, without allocating a second map. The idle sweeper uses it to evict stale
+sessions while collecting the evictees for cleanup outside the lock:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::sweep_loop</div>
+  <pre><code>async fn sweep_loop(self: Arc&lt;Self&gt;) {
+    let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let mut expired = Vec::new();
+        {
+            let mut map = self.sessions.lock().unwrap();
+            map.retain(|_, s| {
+                if s.idle_for() &gt; self.idle_timeout {
+                    expired.push(Arc::clone(s));
+                    false
+                } else {
+                    true
+                }
+            });
+        }</code></pre>
+</div>
+<p>The closure passed to <code>retain</code> returns <code>true</code> to keep an entry,
+<code>false</code> to drop it &mdash; and as a side effect, pushes anything it's about to drop
+into <code>expired</code> first, so the teardown work (logging, waking the return task) can
+happen after the lock is released, not while the map is still held.</p>
+
+<div class="callout callout-go">
+  <span class="callout-label">Go contrast</span>
+  <p>Go's proxy does the same sweep with a manual <code>for range</code> and explicit <code>delete</code>, because Go maps have no <code>retain</code>-style bulk filter:</p><div class="snippet">
+  <div class="snippet-caption">internal/proxy/proxy.go — sweepLoop</div>
+  <pre><code>p.sessionsMu.Lock()
+for key, sess := range p.sessions {
+	if sess.idleFor() &gt; p.idleTimeout {
+		delete(p.sessions, key)
+		idle = append(idle, sess)
+	}
+}
+p.sessionsMu.Unlock()</code></pre>
+</div><p>Same idea, more manual bookkeeping: build a slice by hand while deleting from the map you're iterating (safe in Go specifically for deletion during range, but not for insertion). Rust's <code>retain</code> expresses the same filter-and-collect operation as one named method instead of an open-coded loop.</p>
+</div>
+
+<h2>Iterator adapters are lazy until collect</h2>
+<p>Methods like <code>.iter()</code>, <code>.filter()</code>, and <code>.map()</code> build up
+a chain of work without doing anything &mdash; nothing executes until something actually
+consumes the iterator (<code>.collect()</code>, a <code>for</code> loop, <code>.sum()</code>,
+and so on). <code>Selector::select</code> filters backends down to the healthy subset this
+way:</p>
+<pre><code>let healthy: Vec&lt;&amp;Arc&lt;Backend&gt;&gt; = backends.iter().filter(|b| b.is_healthy()).collect();</code></pre>
+<p>and least-connections selection chains <code>.iter()</code> into
+<code>.min_by_key()</code>:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/strategy.rs — Selector::select</div>
+  <pre><code>Strategy::LeastConnections =&gt; healthy
+    .iter()
+    .min_by_key(|b| b.active_sessions())
+    .copied()
+    .expect("healthy is non-empty"),</code></pre>
+</div>
+<p><code>main.rs</code> builds the backend pool itself with a
+<code>.iter().map().collect()</code> chain, turning a <code>Vec&lt;SocketAddr&gt;</code> from
+config into a <code>Vec&lt;Arc&lt;Backend&gt;&gt;</code>:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/main.rs — serve</div>
+  <pre><code>let backends: Arc&lt;Vec&lt;Arc&lt;Backend&gt;&gt;&gt; = Arc::new(
+    cfg.backends
+        .iter()
+        .map(|addr| Arc::new(Backend::new(*addr)))
+        .collect(),
+);</code></pre>
+</div>
+<p>and backend-list parsing runs a <code>.split(',')</code> iterator through a
+<code>for</code> loop with per-token trimming and validation &mdash; from chapter 2:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — parse_backends</div>
+  <pre><code>for token in raw.split(',') {
+    let token = token.trim();
+    if token.is_empty() {
+        continue;
+    }
+    out.push(parse_addr(token)?);
+}</code></pre>
+</div>
+
+<h2>Turbofish and collect's target-type inference</h2>
+<p><code>.collect()</code> is generic over its output type &mdash; it needs to be told what to
+build, either via the binding's type annotation or via the <strong>turbofish</strong>
+syntax <code>::&lt;Type&gt;</code> at the call site. This crate consistently uses the first
+style, annotating the binding:</p>
+<pre><code>let backend_list: Vec&lt;String&gt; = cfg.backends.iter().map(|b| b.to_string()).collect();</code></pre>
+<p>The alternative &mdash; not used in this crate, shown here purely as a syntax reference
+&mdash; would push the same type information onto the call itself:</p>
+<div class="snippet">
+  <div class="snippet-caption">syntax note — not from this crate</div>
+  <pre><code>let backend_list = cfg.backends.iter().map(|b| b.to_string()).collect::&lt;Vec&lt;_&gt;&gt;();</code></pre>
+</div>
+<p>Both compile to the same code; which one reads better depends on whether the surrounding
+line already makes the target type obvious. This codebase prefers annotating the binding,
+which keeps the chain itself uncluttered.</p>
+
+<h2>Building strings without per-line allocation</h2>
+<p>The Prometheus text renderer builds one big string incrementally instead of formatting and
+concatenating many small ones. <code>String::with_capacity</code> pre-allocates, and
+<code>write!</code>/<code>writeln!</code> (via <code>std::fmt::Write</code>, imported
+explicitly) append formatted text in place:</p>
+<pre><code>use std::fmt::Write as _;</code></pre>
+<pre><code>let mut out = String::with_capacity(2048);</code></pre>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/metrics.rs — metric</div>
+  <pre><code>fn metric(
+    out: &amp;mut String,
+    name: &amp;str,
+    kind: &amp;str,
+    help: &amp;str,
+    samples: &amp;[(&amp;[(&amp;str, &amp;str)], f64)],
+) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+    for (labels, value) in samples {
+        write_sample(out, name, labels, *value);
+    }
+}</code></pre>
+</div>
+<p><code>write!(out, ...)</code> is the string-building sibling of <code>println!</code>
+&mdash; same format-string syntax, different destination. Because <code>out</code> already has
+capacity reserved, appending each metric line only occasionally triggers a reallocation,
+instead of every single <code>format!()</code> call in a naive "concatenate many small
+strings" version allocating its own throwaway <code>String</code>.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/metrics.rs</code>, change <code>String::with_capacity(2048)</code> to <code>String::new()</code> and run <code>cargo test</code> &mdash; the tests still pass, because capacity is a performance hint, not correctness. Then read <code>render()</code>'s full body end to end and count how many separate metric families it emits with this one growing <code>String</code>, versus how many separate HTTP response allocations that would have been with one write call per metric.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="06-structs-traits.html"><span class="label">Previous</span><span class="chapter-nav-title">Structs, impl, traits, derive</span></a><a class="next" href="08-concurrency.html"><span class="label">Next</span><span class="chapter-nav-title">Fearless concurrency</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

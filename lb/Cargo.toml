@@ -1,0 +1,36 @@
+[package]
+name = "quixiot-lb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "An educational L4 UDP load balancer that fronts the QuixIoT QUIC/HTTP3 servers."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "quixiot-lb"
+path = "src/main.rs"
+
+# Two external dependencies, both deliberate:
+#   tokio   — the async runtime and sockets.
+#   socket2 — SO_RCVBUF/SO_SNDBUF sizing, which std does not expose. The Go
+#             proxy sets 8 MiB buffers and this repo measures drop rates, so
+#             matching matters for fair comparisons.
+# Everything else — the strategy math, the RNG, the FNV hash, the Prometheus
+# text exposition, the QUIC header parse — is hand-rolled in std so the crate
+# stays small and the Rust concepts stay in view. See README.md.
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "macros",
+    "signal",
+    "io-util",
+] }
+socket2 = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ownership, moves, borrowing — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="current" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 03</span>
+<h1>Ownership, moves, borrowing</h1>
+
+<p class="lede">This is the chapter that makes Rust feel like a different language rather
+than "Go with semicolons and curly braces." Everything else &mdash; syntax, tooling,
+even most of the type system &mdash; you can pick up by pattern-matching against languages
+you know. Ownership you have to actually learn, because nothing in Go, Python, or Java
+prepares you for it. It's also the single biggest reason this crate has no
+<code>unsafe</code>, no data races, and no "who closes this socket?" bugs.</p>
+
+<h2>The three rules</h2>
+<ol>
+<li>Every value has exactly one owner (one binding, one field, one <code>Vec</code> slot)
+responsible for it.</li>
+<li>Assigning a value, passing it to a function, or returning it <strong>moves</strong>
+ownership for any type that isn't <code>Copy</code> &mdash; the source binding becomes
+invalid, checked at compile time.</li>
+<li>When the owner goes out of scope, the value is dropped &mdash; deterministically,
+immediately, no garbage collector involved.</li>
+</ol>
+<p>Rule 3 is <strong>RAII</strong> (resource acquisition is initialization), and it's the
+part that will feel most foreign coming from Go. A <code>Session</code>'s upstream socket:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Session</div>
+  <pre><code>struct Session {
+    client: SocketAddr,
+    backend: Arc&lt;Backend&gt;,
+    upstream: Arc&lt;UdpSocket&gt;,
+    last_seen_millis: AtomicI64,
+    shutdown: Notify,
+    closed: AtomicBool,
+}</code></pre>
+</div>
+<p>Nowhere in this crate is there an explicit "close this socket" call for
+<code>upstream</code>. The <code>Session</code> is held by an <code>Arc</code> (chapter 8) in
+the session table and by the return task; when the last of those references is dropped
+&mdash; the session is evicted or the client disconnects and everything holding an
+<code>Arc&lt;Session&gt;</code> finishes &mdash; the <code>UdpSocket</code> field's
+<code>Drop</code> implementation runs and the file descriptor closes. There is no path where
+someone forgets.</p>
+
+<div class="callout callout-go">
+  <span class="callout-label">Go contrast</span>
+  <p>Go's equivalent is <code>defer conn.Close()</code> &mdash; it works, but it's a discipline you have to remember to apply at every call site that opens a resource, and code review is what catches the ones you forgot. The Go proxy's session close is explicit and centralized precisely because someone has to call it:</p><div class="snippet">
+  <div class="snippet-caption">internal/proxy/proxy.go — (*session).close</div>
+  <pre><code>func (s *session) close() error {
+	var closeErr error
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if s.onClose != nil {
+			s.onClose()
+		}
+		if err := s.upstreamConn.Close(); err != nil &amp;&amp; !errors.Is(err, net.ErrClosed) {
+			closeErr = err
+		}
+	})
+	return closeErr
+}</code></pre>
+</div><p>In Rust, cleanup is attached to the type itself via <code>Drop</code>, not to a call site that happens to be using it &mdash; you cannot forget to write the equivalent of <code>defer</code>, because there is nothing to write. This is also why Rust has no garbage collector: the compiler already knows, statically, the exact instant every value's last owner disappears, so it inserts the free (or close, or unlock) right there at compile time instead of discovering it's needed at runtime through GC. Chapter 8 puts this <code>close</code> side by side with this crate's exactly-once teardown in full.</p>
+</div>
+
+<h2>Copy vs. move</h2>
+<p>Small, stack-only types (integers, <code>bool</code>, <code>SocketAddr</code>) implement
+<code>Copy</code>: assigning or passing them duplicates the bits, and the original stays
+valid &mdash; ordinary value semantics, exactly what you'd expect from Go. <code>Backend::addr</code>
+returns one by value with no ownership question at all:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — Backend::addr</div>
+  <pre><code>pub fn addr(&amp;self) -&gt; SocketAddr {
+    self.addr
+}</code></pre>
+</div>
+<p>Heap-backed types &mdash; <code>String</code>, <code>Vec&lt;T&gt;</code>, <code>Arc&lt;T&gt;</code>
+&mdash; are <em>not</em> <code>Copy</code>. Assigning one moves it: the old binding is gone,
+enforced at compile time, not just a style convention. When you do want an independent copy
+of one of these, you say so with <code>.clone()</code> &mdash; and for a heap type that's a
+real allocation and copy, not free. For an <code>Arc</code>, by contrast, <code>.clone()</code>
+is a refcount bump (chapter 8 covers exactly when the crate reaches for it, e.g.
+<code>Arc::clone(&amp;backend)</code>). The point either way: in Rust, "this has a cost" and
+"you wrote <code>.clone()</code>" line up. Nothing copies silently behind your back.</p>
+
+<h2>Borrowing: &amp;T and &amp;mut T</h2>
+<p>Instead of moving or cloning, you can <strong>borrow</strong> a reference: <code>&amp;T</code>
+is a shared, read-only borrow (you can have any number of these at once), <code>&amp;mut T</code>
+is an exclusive, mutable borrow (at most one, and it excludes any <code>&amp;T</code> borrows
+existing at the same time). The compiler enforces this &mdash; "aliasing XOR mutation" &mdash;
+statically, for every value, everywhere.</p>
+<p>This sounds academic until you connect it to your actual experience: aliasing plus mutation
+is exactly the precondition for a data race (two threads, one writing) and for iterator
+invalidation (mutating a collection while iterating it) &mdash; two categories of bug that Go
+and C++ code review exist specifically to catch, and still miss. Rust's borrow checker is that
+code-review discipline, formalized and enforced by the compiler on every single build instead
+of by a human on the pull requests they happen to review carefully.</p>
+
+<p>The hot forwarding path leans on shared borrows of buffer slices constantly &mdash; a slice
+<code>&amp;[u8]</code> borrows a contiguous window of a buffer with zero copies:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::run</div>
+  <pre><code>match session.upstream.try_send(&amp;buf[..n]) {
+    Ok(_) =&gt; {}
+    Err(e) if e.kind() == ErrorKind::WouldBlock =&gt; self.metrics.drop_to_server(),
+    Err(e) =&gt; self.handle_upstream_error(&amp;session, e, "send to upstream"),
+}</code></pre>
+</div>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::return_loop</div>
+  <pre><code>match self.listen.try_send_to(&amp;buf[..n], session.client) {
+    Ok(_) =&gt; {}
+    Err(e) if e.kind() == ErrorKind::WouldBlock =&gt; {
+        self.metrics.drop_to_client()
+    }
+    Err(e) =&gt; {
+        warn!("send to client {} failed: {e}", session.client);
+        break;
+    }
+}</code></pre>
+</div>
+<p><code>&amp;buf[..n]</code> borrows the first <code>n</code> bytes of a datagram buffer that
+was read once and reused every iteration &mdash; no per-packet allocation, no copy, and the
+borrow checker guarantees nothing else mutates <code>buf</code> while that slice is alive.
+<code>&amp;str</code>, mentioned last chapter, is exactly this idea specialized to UTF-8 text:
+a borrowed view into string data someone else owns.</p>
+
+<div class="callout callout-warstory">
+  <span class="callout-label">War story: borrow at the call site</span>
+  <p>An early version of the idle-timeout flag handler read:</p><pre><code>"--idle-timeout" =&gt; idle_timeout = Duration::from_secs(parse_u64(&amp;value()?, flag)?),</code></pre><p>which failed to compile with:</p><pre><code>error[E0308]: mismatched types
+  expected &amp;str, found String
+help: consider borrowing here: &amp;flag</code></pre><p><strong>Diagnosis:</strong> <code>parse_u64</code> takes <code>flag: &amp;str</code>, but <code>flag</code> in scope is an owned <code>String</code> (it came from the argument iterator). Passing <code>flag</code> by value would <em>move</em> it &mdash; and this same <code>flag</code> is matched against in every other arm of the surrounding <code>match</code>, so it can't be given away. The compiler's own suggestion is the fix:</p><pre><code>"--idle-timeout" =&gt; idle_timeout = Duration::from_secs(parse_u64(&amp;value()?, &amp;flag)?),</code></pre><p><strong>Deref coercion, while we're here:</strong> notice the function signature wants <code>&amp;str</code> but call sites pass <code>&amp;flag</code> where <code>flag: String</code> &mdash; that compiles because <code>&amp;String</code> coerces to <code>&amp;str</code> automatically (a <code>String</code> is always backed by valid UTF-8 with a <code>&amp;str</code> view available). You will see this coercion constantly: functions in idiomatic Rust almost always take <code>&amp;str</code>, never <code>&amp;String</code>, precisely because callers holding either a <code>String</code> or a string literal can pass a borrow and it just works.</p>
+</div>
+
+<h2>Lifetimes, briefly</h2>
+<p>A reference can't outlive the value it points to &mdash; the compiler checks this too, and
+the mechanism it uses is called a <strong>lifetime</strong>. Most of the time you never write
+one: <em>elision</em> rules infer them from a function's signature. When a method borrows
+<code>self</code> and returns a borrow, the returned reference is understood to borrow from
+<code>self</code> without any annotation:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — Backend::label</div>
+  <pre><code>pub fn label(&amp;self) -&gt; &amp;str {
+    &amp;self.label
+}</code></pre>
+</div>
+<p><code>&amp;self.label</code>'s lifetime is tied to <code>&amp;self</code>'s automatically
+&mdash; the compiler won't let a caller hold onto that <code>&amp;str</code> past the
+<code>Backend</code>'s own lifetime. The one lifetime annotation you will see in this crate is
+<code>&amp;'static str</code>, meaning "borrowed data that lives for the entire program"
+&mdash; true of string literals, which is exactly what <code>Strategy::label</code> returns:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/strategy.rs — Strategy::label</div>
+  <pre><code>pub fn label(self) -&gt; &amp;'static str {
+    match self {
+        Strategy::RoundRobin =&gt; "round-robin",
+        Strategy::LeastConnections =&gt; "least-conn",
+        Strategy::Random =&gt; "random",
+        Strategy::IpHash =&gt; "ip-hash",
+    }
+}</code></pre>
+</div>
+<p>That's genuinely most of what you need to <em>read</em> lifetimes in this codebase.
+Writing more elaborate lifetime-generic code is a real skill, but it isn't load-bearing for
+understanding <code>lb/</code> &mdash; elision handles essentially everything here.</p>
+
+<div class="callout callout-go">
+  <span class="callout-label">Go contrast</span>
+  <p>Go's garbage collector and escape analysis solve a related problem differently: the compiler decides whether a value can live on the stack or must be heap-allocated based on whether a reference to it escapes the function, and the GC keeps anything still-reachable alive for as long as needed, full stop. You never annotate this and you never think about it &mdash; the cost is a runtime GC pass and less predictable latency. Rust's borrow checker proves the same &ldquo;no reference outlives its data&rdquo; property statically, at compile time, with zero runtime cost and zero GC pauses &mdash; the cost moves from runtime to your compile-time attention, which is the trade the rest of this chapter has been about.</p>
+</div>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/config.rs</code>, find the <code>--health-interval</code> arm and change <code>parse_u64(&amp;value()?, &amp;flag)?</code> to <code>parse_u64(&amp;value()?, flag)?</code> (drop the borrow). Run <code>cargo build</code> and read the error &mdash; you should see the same shape as war story #2, but notice which later use of <code>flag</code> the compiler points at as the reason the move is illegal. Revert when you're done.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="02-fundamentals.html"><span class="label">Previous</span><span class="chapter-nav-title">Bindings, types, expressions</span></a><a class="next" href="04-enums-matching.html"><span class="label">Next</span><span class="chapter-nav-title">Enums, match, Option</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

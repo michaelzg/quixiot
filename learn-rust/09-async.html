@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Async with tokio — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="current" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 09</span>
+<h1>Async with tokio</h1>
+
+<p class="lede">Tokio gives Rust the goroutine-shaped mental model you already have &mdash;
+lightweight tasks, a scheduler, non-blocking I/O &mdash; but the machinery is opt-in and
+visible rather than built into the runtime, and that visibility is exactly what caused (and
+eventually explained) the most instructive bug in this crate's history.</p>
+
+<h2>The mental model</h2>
+<p>An <code>async fn</code> doesn't run when called &mdash; calling it produces a state
+machine (a value implementing <code>Future</code>) that does nothing until something polls it,
+typically via <code>.await</code>. A tokio runtime is what actually polls futures to
+completion, scheduling many of them across a thread pool. Tasks (spawned with
+<code>tokio::spawn</code>) are tokio's rough equivalent of goroutines &mdash; cheap, many-per-thread,
+scheduled by the runtime rather than the OS &mdash; but they're <em>cooperatively</em>
+scheduled at <code>.await</code> points, not preemptible the way Go's runtime can interrupt a
+goroutine between almost any two instructions. A task that never awaits never yields.</p>
+
+<p><code>main.rs</code> builds a small multi-thread runtime explicitly, rather than using the
+<code>#[tokio::main]</code> macro that hides this:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/main.rs — main</div>
+  <pre><code>let runtime = match tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(2)
+    .enable_all()
+    .build()
+{
+    Ok(rt) =&gt; rt,
+    Err(e) =&gt; {
+        eprintln!("quixiot-lb: failed to start runtime: {e}");
+        return ExitCode::FAILURE;
+    }
+};</code></pre>
+</div>
+<p>Two worker threads, every tokio feature enabled (timers, I/O, signals), then
+<code>block_on</code> drives the top-level <code>serve(cfg)</code> future to completion on
+this runtime &mdash; the one place the whole async machinery is entered from synchronous
+<code>main</code>. The comment explains the worker count choice: this workload is I/O-bound,
+so a couple of workers keep the receive loop and return tasks moving without oversubscribing
+the machine with more OS threads than there's parallel work to do.</p>
+
+<h2>Spawning tasks</h2>
+<p><code>tokio::spawn</code> hands a future to the runtime and returns immediately with a
+<code>JoinHandle</code>; the task runs independently, detached from the spawner unless you
+explicitly await or abort the handle. This crate spawns three kinds of long-running task: one
+return task per session,</p>
+<pre><code>tokio::spawn(Arc::clone(self).return_loop(Arc::clone(&amp;session)));</code></pre>
+<p>the idle sweeper,</p>
+<pre><code>let sweeper = tokio::spawn(Arc::clone(&amp;self).sweep_loop());</code></pre>
+<p>and one health-probe loop per backend:</p>
+<pre><code>tokio::spawn(probe_loop(config, backend));</code></pre>
+<p>The sweeper is also the one task this crate cancels explicitly rather than letting run
+forever: when the accept loop exits (shutdown), it calls <code>abort()</code> on the sweeper's
+handle to stop it immediately rather than waiting for its next tick:</p>
+<pre><code>sweeper.abort();</code></pre>
+
+<h2>select!: whichever completes first</h2>
+<p><code>tokio::select!</code> polls several futures concurrently and proceeds with whichever
+resolves first, dropping the others' partially-completed state. The accept loop races a
+shutdown signal against the next incoming datagram:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::run</div>
+  <pre><code>loop {
+    let recv = self.listen.recv_from(&amp;mut buf);
+    let (n, client) = tokio::select! {
+        _ = shutdown.notified() =&gt; {
+            info!("shutdown requested; stopping accept loop");
+            break;
+        }
+        result = recv =&gt; match result {
+            Ok(pair) =&gt; pair,
+            Err(e) =&gt; {
+                error!("recv_from on listen socket failed: {e}");
+                break;
+            }
+        },
+    };</code></pre>
+</div>
+<p>and every session's return task races the same shutdown signal against the next reply from
+that session's upstream socket:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::return_loop</div>
+  <pre><code>    tokio::select! {
+        _ = session.shutdown.notified() =&gt; break,
+        result = session.upstream.recv(&amp;mut buf) =&gt; match result {
+            Ok(n) =&gt; {
+                session.touch();
+                self.metrics.add_to_client(n);
+                // Same drop-not-block rationale as the accept loop: the
+                // listen socket is shared by every session's return
+                // task, so nobody gets to park on it.
+                match self.listen.try_send_to(&amp;buf[..n], session.client) {
+                    Ok(_) =&gt; {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock =&gt; {
+                        self.metrics.drop_to_client()
+                    }
+                    Err(e) =&gt; {
+                        warn!("send to client {} failed: {e}", session.client);
+                        break;
+                    }
+                }
+            }
+            Err(e) =&gt; {
+                self.handle_upstream_error(&amp;session, e, "recv from upstream");
+                break;
+            }
+        },
+    }
+}</code></pre>
+</div>
+<p><strong>Cancellation safety</strong> in one paragraph: when <code>select!</code> picks a
+winner, the losing branch's future is simply dropped mid-poll. For a plain
+<code>.notified()</code> or <code>.recv_from()</code> call, that's safe &mdash; there's no
+partial side effect to worry about, the operation just didn't happen. It's a real design
+constraint you'd need to think about with more stateful futures (a half-completed multi-step
+operation), but every <code>select!</code> in this crate races futures that are safe to
+abandon this way.</p>
+
+<div class="callout callout-go">
+  <span class="callout-label">Go contrast</span>
+  <p>Go's netpoller blocks a goroutine on a channel or a network read transparently &mdash; the scheduler parks it and resumes it later, and you never see the readiness machinery underneath. Rust's futures make that machinery an explicit, visible layer: <code>select!</code> is you naming exactly which operations are racing, and (as the war story below shows) the readiness state each socket carries is something you can occasionally observe directly rather than never at all.</p>
+</div>
+
+<h2>Notify: permit semantics</h2>
+<p><code>tokio::sync::Notify</code> is a minimal wake-up signal, simpler than a channel: no
+payload, just "something happened, wake up." Its useful subtlety is that
+<code>notify_one()</code> stores a permit if nobody is currently waiting, so a signal sent
+between two poll iterations of the waiter's loop isn't lost &mdash; a plain condition-variable-style
+signal can drop a wakeup that arrives in that gap. The comment in
+<code>spawn_signal_handler</code> states this directly:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/main.rs — spawn_signal_handler</div>
+  <pre><code>fn spawn_signal_handler(shutdown: Arc&lt;Notify&gt;) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) =&gt; s,
+                Err(e) =&gt; {
+                    warn!("cannot install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() =&gt; info!("received Ctrl-C"),
+                _ = term.recv() =&gt; info!("received SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("received Ctrl-C");
+        }
+        // notify_one stores a permit if the accept loop isn't parked in select
+        // at this instant, so the shutdown can't be missed between iterations.
+        shutdown.notify_one();
+    });
+}</code></pre>
+</div>
+<p>Ctrl-C or SIGTERM (on Unix, raced against each other with their own inner
+<code>select!</code>) calls <code>shutdown.notify_one()</code> exactly once; whichever of the
+accept loop's future iterations is either already waiting on <code>shutdown.notified()</code>
+or gets there microseconds later, the permit guarantees it wakes.</p>
+
+<h2>tokio::time: timeout and interval</h2>
+<p><code>tokio::time::timeout</code> wraps any future with a deadline, turning "no reply in N
+milliseconds" into an ordinary <code>Result</code> branch instead of a callback or a second
+watcher task. The active health checker uses it directly:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/health.rs — probe_once</div>
+  <pre><code>async fn probe_once(sock: &amp;UdpSocket, timeout: Duration) -&gt; Result&lt;(), String&gt; {
+    // Drain anything already queued (e.g. a late reply to the *previous*
+    // probe), so a stale packet can't be credited to this round. try_recv
+    // returns WouldBlock once empty; any other error will resurface below.
+    let mut buf = [0u8; 2048];
+    while sock.try_recv(&amp;mut buf).is_ok() {}
+
+    let packet = build_probe();
+    sock.send(&amp;packet).await.map_err(|e| format!("send: {e}"))?;
+
+    match time::timeout(timeout, sock.recv(&amp;mut buf)).await {
+        Ok(Ok(_n)) =&gt; Ok(()),                    // any reply -&gt; alive
+        Ok(Err(e)) =&gt; Err(format!("recv: {e}")), // e.g. ECONNREFUSED -&gt; dead
+        Err(_) =&gt; Err("timeout".into()),
+    }
+}</code></pre>
+</div>
+<p><code>interval</code> plus <code>MissedTickBehavior::Skip</code> is the periodic-timer
+pattern: if a tick is missed (a slow probe delaying the next one), skip straight to the next
+scheduled tick instead of firing a burst of catch-up ticks back to back:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/health.rs — probe_loop</div>
+  <pre><code>async fn probe_loop(config: Arc&lt;Config&gt;, backend: Arc&lt;Backend&gt;) {
+    let mut ticker = time::interval(config.health_interval);
+    // If a tick is missed (e.g. a slow probe), skip it rather than firing a burst.
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);</code></pre>
+</div>
+
+<div class="callout callout-warstory">
+  <span class="callout-label">War story: the try_send readiness bug (the centerpiece)</span>
+  <p>This is the bug that most directly justifies this chapter existing. It happened in roughly this order.</p><p><strong>1. The change.</strong> The hot forwarding path was switched from <code>send().await</code> to <code>try_send</code>, on purpose: this loop serves every client, so it must never park waiting on one session's socket buffer. A full buffer should drop that one datagram (safe under UDP/QUIC semantics; the client retransmits) and move on &mdash; drop-not-block, not stall-everyone.</p><p><strong>2. The failure.</strong> New integration tests spinning up real UDP echo backends failed on every run &mdash; specifically, the <em>first</em> packet of every new session vanished. The test assertion read (from the test helper's <code>.expect("reply within 2s")</code>):</p><pre><code>panicked at 'reply within 2s: Elapsed(())'</code></pre><p><strong>3. The diagnosis.</strong> Tokio's <code>try_*</code> methods (<code>try_send</code>, <code>try_send_to</code>) don't ask the OS &ldquo;is this socket writable right now&rdquo; on every call &mdash; that would defeat the point of being non-blocking. They consult the reactor's <em>cached</em> readiness state. A freshly registered socket hasn't yet observed its first writable-ready event from the OS, so that cached state starts out not-ready, and the very first <code>try_send</code> on a brand-new socket spuriously reports <code>WouldBlock</code> &mdash; even though the socket's send buffer is, in reality, completely empty and ready. The datagram that opened the session got silently dropped by the code that correctly treats <code>WouldBlock</code> as &ldquo;drop and count it&rdquo;.</p><p><strong>4. The fix.</strong> Prime each socket's write readiness once, explicitly, with <code>writable().await</code> before the first real <code>try_send</code> &mdash; at both call sites where a fresh socket enters service:</p><div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::run</div>
+  <pre><code>pub async fn run(self: Arc&lt;Self&gt;, shutdown: Arc&lt;Notify&gt;) {
+    // Prime the listen socket's write readiness so the return tasks'
+    // try_send_to doesn't spuriously drop the first replies (see
+    // dial_upstream for the full story).
+    if let Err(e) = self.listen.writable().await {
+        error!("listen socket is unusable for writes: {e}");
+        return;
+    }
+    let sweeper = tokio::spawn(Arc::clone(&amp;self).sweep_loop());</code></pre>
+</div><div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::dial_upstream</div>
+  <pre><code>async fn dial_upstream(&amp;self, backend: &amp;Backend) -&gt; std::io::Result&lt;UdpSocket&gt; {
+    // Sized kernel buffers (like the Go proxy's 8 MiB) so return-path
+    // bursts from the backend aren't dropped at the socket before we can
+    // read them.
+    let (sock, _granted) = net::bind_udp(net::wildcard_for(backend.addr()), net::BUFFER_BYTES)?;
+    sock.connect(backend.addr()).await?;
+    // Prime write readiness once. tokio's try_send consults the reactor's
+    // *cached* readiness, and a freshly registered socket hasn't seen its
+    // first writable event yet — without this await the session's first
+    // try_send spuriously reports WouldBlock and we'd drop the packet.
+    // After priming, WouldBlock from try_send means "buffer really full".
+    sock.writable().await?;
+    Ok(sock)
+}</code></pre>
+</div><p><strong>5. The morals.</strong> Async runtimes have observable internals &mdash; &ldquo;non-blocking&rdquo; doesn't mean &ldquo;stateless,&rdquo; and a cached-readiness optimization can leak into observable behavior at exactly the boundary (a fresh socket's very first send) where you'd least expect it. And live QUIC traffic had never surfaced this in manual testing, precisely because real QUIC clients retransmit an unanswered Initial packet &mdash; the bug was silently self-healing under real traffic and only visible under a test harness with a bounded timeout and no retransmission to paper over the drop. Tests catching what demos mask is the whole reason chapter 11 exists.</p>
+</div>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/balancer.rs</code>, comment out the <code>sock.writable().await?;</code> line inside <code>dial_upstream</code> and run <code>cargo test</code> in <code>lb/</code>. Watch <code>sticky_sessions_and_round_robin_distribution</code> and <code>recovered_backend_receives_new_sessions</code> fail with <code>reply within 2s: Elapsed(())</code> &mdash; on this machine the race loses every time, though readiness-caching bugs can be timing-sensitive elsewhere. Then restore the line and confirm the suite is green again. This is war story #4, reproduced by your own hands instead of read about.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="08-concurrency.html"><span class="label">Previous</span><span class="chapter-nav-title">Fearless concurrency</span></a><a class="next" href="10-parsing-macros.html"><span class="label">Next</span><span class="chapter-nav-title">Parsing bytes and macro_rules!</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

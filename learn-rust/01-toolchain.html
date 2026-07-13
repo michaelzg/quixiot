@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cargo and the anatomy of a crate — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="current" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 01</span>
+<h1>Cargo and the anatomy of a crate</h1>
+
+<p class="lede">Cargo is Rust's build tool, package manager, and test runner in one binary
+&mdash; think <code>go build</code> + <code>go mod</code> + <code>go test</code> collapsed
+into a single command with a project-wide manifest, rather than three tools that happen to
+agree with each other.</p>
+
+<h2>rustup, cargo, rustc</h2>
+<p><strong>rustup</strong> installs and switches Rust toolchains (stable/beta/nightly,
+cross-targets) &mdash; the analogue of managing multiple Go versions with <code>g</code> or
+<code>goenv</code>, except it's the official, universally-used tool. <strong>cargo</strong> is
+what you actually type day to day: it resolves dependencies, invokes the compiler, runs
+tests, and formats and lints code. <strong>rustc</strong> is the compiler itself; you will
+rarely invoke it directly, the same way you rarely call the Go compiler binary instead of
+<code>go build</code>.</p>
+
+<p>The commands you'll use constantly:</p>
+<ul>
+<li><code>cargo build</code> &mdash; compile (debug profile: fast to compile, unoptimized).</li>
+<li><code>cargo run</code> &mdash; build and run the binary target.</li>
+<li><code>cargo test</code> &mdash; compile and run every <code>#[test]</code> function
+(chapter 11).</li>
+<li><code>cargo clippy</code> &mdash; a much stricter linter than the compiler's own warnings
+(chapter 11).</li>
+<li><code>cargo fmt</code> &mdash; canonical formatting, no configuration debates
+(chapter 11).</li>
+<li><code>cargo build --release</code> / <code>cargo run --release</code> &mdash; build with
+optimizations on, using the <code>[profile.release]</code> settings below. Debug builds are
+for iterating; you'd never ship one.</li>
+</ul>
+<p>This repo wraps the common cases: <code>make lb</code> builds the crate,
+<code>make lb-test</code> runs its test suite, <code>make lb-demo</code> runs a full
+three-backend scenario against a real build.</p>
+
+<h2>Anatomy of <code>lb/Cargo.toml</code></h2>
+<p>Every crate (Rust's word for "package" &mdash; a compilation unit with its own
+<code>Cargo.toml</code>) declares itself in a manifest. Here is the whole file:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/Cargo.toml</div>
+  <pre><code>[package]
+name = "quixiot-lb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "An educational L4 UDP load balancer that fronts the QuixIoT QUIC/HTTP3 servers."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "quixiot-lb"
+path = "src/main.rs"
+
+# Two external dependencies, both deliberate:
+#   tokio   — the async runtime and sockets.
+#   socket2 — SO_RCVBUF/SO_SNDBUF sizing, which std does not expose. The Go
+#             proxy sets 8 MiB buffers and this repo measures drop rates, so
+#             matching matters for fair comparisons.
+# Everything else — the strategy math, the RNG, the FNV hash, the Prometheus
+# text exposition, the QUIC header parse — is hand-rolled in std so the crate
+# stays small and the Rust concepts stay in view. See README.md.
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "macros",
+    "signal",
+    "io-util",
+] }
+socket2 = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"</code></pre>
+</div>
+
+<p><code>[package]</code> names the crate and pins an <code>edition</code> &mdash; a
+Rust-version-independent opt-in to language changes (2021 here), plus a
+<code>rust-version</code> floor the crate promises to compile with. <code>[[bin]]</code>
+declares a binary target explicitly: name and entry-point path. (A <code>lib.rs</code> would
+declare a library target instead; a crate can have one library and many binaries.)</p>
+
+<p><code>[dependencies]</code> lists exactly two external crates, and the comment above them
+explains why each earns its place: <code>tokio</code> for the async runtime and sockets, with
+an explicit <strong>feature flag list</strong> &mdash; <code>rt-multi-thread</code>,
+<code>net</code>, <code>time</code>, <code>sync</code>, <code>macros</code>,
+<code>signal</code>, <code>io-util</code> &mdash; so the build only compiles the parts of
+tokio this binary actually uses, rather than the whole runtime. <code>socket2</code> exists
+for exactly one thing std doesn't expose: setting <code>SO_RCVBUF</code>/<code>SO_SNDBUF</code>
+buffer sizes (see chapter 3). Everything else in this crate &mdash; the load-balancing math,
+the RNG, the FNV hash, the Prometheus text format, the QUIC header parser &mdash; is hand-rolled
+against the standard library. That's a deliberate choice to keep the Rust concepts in view
+instead of buried inside a dependency.</p>
+
+<p><code>version = "1"</code> for tokio is a <strong>caret requirement</strong>: it means
+"&ge;1.0.0, &lt;2.0.0" &mdash; any semver-compatible 1.x release. Cargo resolves the newest
+version matching every dependency's constraints and records the exact versions it picked in
+<code>Cargo.lock</code>. For a <em>binary</em> crate like this one, that lockfile is checked
+into version control (the same instinct as vendoring or a Go workspace's
+<code>go.sum</code>): a fresh checkout builds against the exact dependency graph that was
+tested, not "whatever satisfies the ranges today."</p>
+
+<p><code>[profile.release]</code> tunes the optimized build: <code>opt-level = 3</code> is
+maximum optimization, and <code>lto = "thin"</code> enables a lighter-weight form of
+link-time optimization (inlining and dead-code elimination across the whole dependency graph,
+not just within one compilation unit) &mdash; cheaper to compile than full LTO, most of the
+runtime benefit.</p>
+
+<div class="callout callout-go">
+  <span class="callout-label">Go contrast</span>
+  <p>Go infers a module's dependency graph from imports plus <code>go.mod</code>/<code>go.sum</code>; there's no per-target manifest section because a Go module usually builds one thing. Cargo separates <em>what the crate is</em> (<code>[package]</code>, <code>[[bin]]</code>) from <em>what it depends on</em> (<code>[dependencies]</code>) from <em>how to optimize it</em> (<code>[profile.*]</code>) as distinct declarative sections in one file. Both ecosystems reject circular imports outright &mdash; Go at the package level, Rust at the crate and module level.</p>
+</div>
+
+<h2>Crates vs. modules</h2>
+<p>A <strong>crate</strong> is a compilation unit &mdash; roughly Go's "module," a unit with
+its own dependency manifest. Inside a crate, <strong>modules</strong> (<code>mod</code>) are
+the namespace tree, closer to Go's packages, except Go infers packages from directory
+structure while Rust requires an explicit <code>mod</code> declaration to bring a file into
+the tree at all. <code>lb/src/main.rs</code> declares every other file in the crate as a
+module up front:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/main.rs</div>
+  <pre><code>#[macro_use]
+mod log;
+mod backend;
+mod balancer;
+mod config;
+mod health;
+mod metrics;
+mod net;
+mod quic;
+mod strategy;</code></pre>
+</div>
+<p>Each <code>mod backend;</code> tells the compiler "load <code>src/backend.rs</code> as the
+<code>backend</code> module" (Rust also supports <code>backend/mod.rs</code> or
+<code>backend/*.rs</code> for modules with children; this crate is flat enough not to need
+that). <code>#[macro_use]</code> above <code>mod log;</code> is a gotcha covered in chapter
+10 &mdash; module order matters when a module exports macros other modules use.</p>
+
+<p>Once declared, items are reached with <strong>paths</strong>: <code>crate::log::Level</code>
+from anywhere in the crate, or a bare <code>log::Level</code> from a sibling module, or &mdash;
+after a <code>use</code> &mdash; just <code>Level</code>. <code>main.rs</code>'s <code>use</code>
+block pulls the types it needs into scope by their short names:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/main.rs</div>
+  <pre><code>use std::process::ExitCode;
+use std::sync::Arc;
+
+use tokio::sync::Notify;
+
+use backend::Backend;
+use balancer::Balancer;
+use config::{Config, ParseOutcome};
+use metrics::Metrics;
+use strategy::Selector;</code></pre>
+</div>
+<p>Everything is private by default: a function, struct field, or module is invisible outside
+its defining module unless marked <code>pub</code>. <code>Backend</code>'s fields are a good
+example (chapter 6) &mdash; private fields force callers through accessor methods, which is
+how the crate guarantees every mutation of a backend's state goes through an atomic op.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/</code>, run <code>cargo build</code> and <code>cargo build --release</code> and compare <code>target/debug/quixiot-lb</code> and <code>target/release/quixiot-lb</code> with <code>ls -lh</code> (or time a <code>cargo test</code> run in each profile). Then run <code>cargo doc --no-deps --open</code> and browse the generated docs for the crate &mdash; notice that doc comments (<code>//!</code> at the top of each file, which you've now read in every source excerpt on this site) become the page prose.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="index.html"><span class="label">Previous</span><span class="chapter-nav-title">Learn Rust from a working load balancer</span></a><a class="next" href="02-fundamentals.html"><span class="label">Next</span><span class="chapter-nav-title">Bindings, types, expressions</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

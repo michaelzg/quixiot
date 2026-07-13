@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust vs Go retrospective — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="current" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 12</span>
+<h1>Rust vs Go retrospective</h1>
+
+<p class="lede">You've now read every major corner of a real, working Rust service, mapped
+directly against a Go codebase that solves the identical problem. This chapter closes the
+loop: one table, an honest scorecard in both directions, and where to go from here.</p>
+
+<h2>Concept map</h2>
+<div class="table-wrap"><table><thead><tr><th>Concept</th><th>Go</th><th>Rust</th><th>See</th></tr></thead><tbody><tr><td>Concurrent unit of work</td><td>goroutine (preemptible, OS-scheduled)</td><td>task (cooperative at <code>.await</code>, tokio-scheduled)</td><td>ch. 9</td></tr><tr><td>Cross-task signaling</td><td>channel (<code>chan struct{}</code>, buffered queues)</td><td><code>Notify</code> (permit-storing wake) + <code>mpsc</code> channels</td><td>ch. 9</td></tr><tr><td>Exactly-once teardown</td><td><code>sync.Once</code> + channel close</td><td><code>AtomicBool</code> compare-and-swap</td><td>ch. 8</td></tr><tr><td>Deterministic cleanup</td><td><code>defer conn.Close()</code></td><td><code>Drop</code>, run automatically at scope end</td><td>ch. 3</td></tr><tr><td>Fallible return</td><td><code>(T, error)</code>, checked by convention</td><td><code>Result&lt;T, E&gt;</code> + <code>?</code>, checked by the compiler</td><td>ch. 5</td></tr><tr><td>Absence of a value</td><td><code>nil</code> (hides in pointers/maps/interfaces)</td><td><code>Option&lt;T&gt;</code>, a real enum</td><td>ch. 4</td></tr><tr><td>Behavior contract</td><td>interface (structural, runtime dispatch)</td><td>trait (explicit <code>impl</code>, static dispatch by default)</td><td>ch. 6</td></tr><tr><td>Memory management</td><td>garbage collector + escape analysis</td><td>ownership + borrow checker, no GC</td><td>ch. 3</td></tr><tr><td>Static analysis habit</td><td><code>go vet</code>, <code>staticcheck</code></td><td><code>cargo clippy</code></td><td>ch. 11</td></tr></tbody></table></div>
+
+<div class="callout callout-gotcha">
+  <span class="callout-label">Reading this table honestly</span>
+  <p>Treat every row as &ldquo;closest analogue,&rdquo; not &ldquo;identical mechanism.&rdquo; <code>Notify</code> plus an <code>mpsc</code> channel covers what a bare Go channel does, but they're two different Rust primitives reached for in different situations, not one drop-in replacement. Trait dispatch is static by default in Rust and dynamic by default for a Go interface value &mdash; a real behavioral difference, not just a spelling one. The table is a map to help you orient, not a claim that the two languages are secretly the same language.</p>
+</div>
+
+<h2>Where Go was honestly simpler</h2>
+<ul>
+<li><strong>No readiness priming needed.</strong> War story #4 (chapter 9) was entirely a
+consequence of Rust's non-blocking I/O making reactor readiness state observable. Go's
+netpoller hides exactly this layer &mdash; <code>conn.Write()</code> blocks the goroutine
+transparently until the OS says the socket is writable, so a fresh socket's first write can
+never surprise you with a spurious not-ready result. That whole category of bug simply cannot
+happen in the Go proxy.</li>
+<li><strong>GC removes an entire axis of thought.</strong> Nothing in the Go codebase needed a
+moment's consideration of who owns a value or how long a reference can live &mdash; the
+garbage collector made that a non-question. Chapter 3's ownership rules buy real guarantees,
+but they are a genuine, continuous tax on how you write code, especially early on.</li>
+<li><strong>Faster compile loop.</strong> Go's compiler is famously fast; Rust's borrow
+checker, trait resolution, and (for release builds) LTO make the edit-compile-test cycle
+noticeably slower, particularly for <code>cargo build --release</code>. This crate is small
+enough that it barely matters; it matters a great deal more at scale.</li>
+</ul>
+
+<h2>What Rust bought this crate</h2>
+<ul>
+<li><strong>Data-race prevention at compile time.</strong> Chapter 8's whole premise:
+<code>Backend</code> is safe to share across every task touching it because the compiler
+proved it, not because a reviewer checked it carefully.</li>
+<li><strong>Exhaustive matching as a standing guarantee.</strong> Chapter 4: add a
+<code>Strategy</code> variant and the compiler finds every site that needs updating, forever,
+automatically &mdash; no grep, no hoping you remembered everywhere.</li>
+<li><strong>No-null, no-exception control flow.</strong> <code>Option</code> and
+<code>Result</code> (chapters 4 and 5) make "this might not exist" and "this might fail" part
+of a function's type, not an implicit possibility a caller has to remember to guard against.</li>
+</ul>
+<p>Keep this scorecard honest rather than one-sided: both languages made deliberate,
+defensible trade-offs, and this repo's own choice to implement the same load balancer twice
+&mdash; once in each &mdash; is precisely so those trade-offs are visible side by side instead
+of argued about in the abstract.</p>
+
+<h2>Where to go next</h2>
+<p>Reading this site is a start, not a substitute for writing Rust. Three habits worth
+building:</p>
+<ul>
+<li>Work through <a href="https://doc.rust-lang.org/book/">The Rust Book</a> (further
+reading, not loaded by this site) end to end &mdash; it covers everything here in more depth,
+plus trait objects, <code>Rc</code>/<code>RefCell</code>, and other topics this guide
+deliberately skipped as not load-bearing for reading <code>lb/</code>.</li>
+<li>Do a pass of <a href="https://github.com/rust-lang/rustlings">Rustlings</a> &mdash; small,
+broken programs you fix one compiler error at a time. It's the fastest way to get fluent in
+reading the exact kind of error messages chapters 2, 3, and 6 walked through.</li>
+<li>Build the habit of reading <a href="https://doc.rust-lang.org/std/">std docs</a> for
+<code>Option</code>, <code>Result</code>, and <code>Iterator</code>'s method lists start to
+finish at least once. Idiomatic Rust leans heavily on combinators (chapter 4's
+<code>ok_or_else</code>/<code>map_err</code>, chapter 7's iterator chains); knowing what's
+available changes how you write every function afterward.</li>
+</ul>
+
+<h3>Concrete exercises against this crate</h3>
+<p>All four touch real files you've now read in full. Do them in a scratch branch off this
+repo, and lean on <code>cargo test</code> as you go &mdash; and on the exhaustiveness checking
+from chapter 4, which will find most of the call sites for you.</p>
+<ol>
+<li><strong>Add a <code>weighted</code> strategy</strong> (<code>--backends addr@3,addr@1</code>
+&mdash; higher weight means proportionally more new sessions). Touches
+<code>config.rs</code>'s backend-list parsing, a new <code>Strategy::Weighted</code> variant in
+<code>strategy.rs</code>, and new tests alongside the existing strategy tests.</li>
+<li><strong>Add a <code>quixiot_lb_backend_health_transitions_total</code> metric</strong>
+counting up→down and down→up edges per backend. Touches <code>backend.rs</code>'s
+<code>mark_up</code>/<code>mark_down</code> (chapter 6) and <code>metrics.rs</code>'s
+<code>render</code> (chapter 7).</li>
+<li><strong>Make the idle sweep interval configurable</strong> (currently the
+<code>SWEEP_INTERVAL</code> constant in <code>balancer.rs</code>). Config plumbing end to end:
+a new flag in <code>config.rs</code>, a new <code>Config</code> field, threaded into
+<code>Balancer::new</code>.</li>
+<li><strong>Harder: per-session byte counters</strong>, exposed with a <code>/metrics</code>
+label per backend. Touches the <code>Session</code> struct (chapter 3), the forwarding loops
+in <code>balancer.rs</code> (chapter 9), and the labeled-series rendering pattern already used
+for <code>quixiot_lb_backend_sessions_active</code> in <code>metrics.rs</code> (chapter 7).</li>
+</ol>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>Pick exercise 1, the weighted strategy, and actually build it. Start in <code>lb/src/strategy.rs</code>: add <code>Weighted</code> to the <code>Strategy</code> enum (chapter 4's exhaustiveness check will now show you every match arm that needs updating), extend <code>Selector</code> to hold per-backend weights, and write a deterministic test in the same style as <code>round_robin_cycles</code> (chapter 11) asserting the distribution matches the configured weights over a fixed number of selections. Then wire <code>--backends addr@3,addr@1</code> parsing into <code>config.rs::parse_backends</code> (chapter 2's <code>for</code>-loop-over-split pattern, extended to split on <code>@</code> too). Run <code>cargo test</code> the whole way &mdash; this exercise alone touches ownership, enums, generics, iterators, and testing, which is exactly why it's the first one.</p>
+</div>
+
+<p>One last verbatim data point to send you off with &mdash; the signature that started
+chapter 4's whole discussion of why this crate has no null:</p>
+<pre><code>pub fn select(&amp;self, backends: &amp;[Arc&lt;Backend&gt;], client: IpAddr) -&gt; Option&lt;Arc&lt;Backend&gt;&gt; {</code></pre>
+<p>If that line reads as obviously correct now, rather than needing a second look, this guide
+did its job.</p>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="11-testing.html"><span class="label">Previous</span><span class="chapter-nav-title">Testing, clippy, fmt</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

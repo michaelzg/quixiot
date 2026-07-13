@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Structs, impl, traits, derive — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="current" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 06</span>
+<h1>Structs, impl, traits, derive</h1>
+
+<p class="lede"><code>struct</code> plus <code>impl</code> is Rust's answer to "define a
+type and its behavior," and <code>trait</code> is its answer to "interface" &mdash; both will
+feel immediately familiar, with a few sharp differences worth calling out precisely.</p>
+
+<h2>Struct + impl: Backend as a tour</h2>
+<p>A struct is just fields; behavior lives in one or more separate <code>impl</code> blocks.
+<code>Backend</code>'s fields are private by default (no <code>pub</code>):</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — Backend</div>
+  <pre><code>pub struct Backend {
+    addr: SocketAddr,
+    /// Label used in logs and metrics; the address string is stable and unique.
+    label: String,
+    healthy: AtomicBool,
+    active_sessions: AtomicI64,
+    selected_total: AtomicU64,
+    /// Consecutive active-probe failures; reset to 0 on any success.
+    health_failures: AtomicU64,
+}</code></pre>
+</div>
+<p>Privacy means nothing outside <code>backend.rs</code> can construct a <code>Backend</code>
+with an inconsistent state or mutate <code>healthy</code> directly &mdash; every read and
+write goes through a method, and every one of those methods goes through an atomic operation
+(chapter 8). This is Rust's version of "make the zero value useless, force construction
+through a constructor" &mdash; enforced by the compiler, not just convention.</p>
+
+<p>Methods take <code>self</code> in one of three forms, and the crate uses only the first
+two: <code>&amp;self</code> (shared borrow &mdash; can read, can't mutate directly),
+<code>&amp;mut self</code> (exclusive borrow &mdash; can mutate), or plain <code>self</code>
+(takes ownership, consuming the value &mdash; used for builder-style APIs that transform and
+return a new value, rare in this crate). Every <code>Backend</code> method takes
+<code>&amp;self</code>, even the ones that update counters:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — mark_up / mark_down</div>
+  <pre><code>/// Mark healthy and clear the failure streak. Logs only on the down→up edge
+/// so steady-state probing stays quiet.
+pub fn mark_up(&amp;self) {
+    self.health_failures.store(0, Ordering::Relaxed);
+    if !self.healthy.swap(true, Ordering::Relaxed) {
+        info!("backend {} recovered -&gt; healthy", self.label);
+    }
+}
+
+/// Mark unhealthy immediately. Logs only on the up→down edge.
+pub fn mark_down(&amp;self) {
+    if self.healthy.swap(false, Ordering::Relaxed) {
+        warn!("backend {} marked unhealthy", self.label);
+    }
+}</code></pre>
+</div>
+<p><code>mark_up</code> and <code>mark_down</code> clearly mutate state, yet neither needs
+<code>&amp;mut self</code>. That's only possible because every field is an atomic type with
+<em>interior mutability</em> &mdash; the ability to mutate through a shared reference, safely,
+via the hardware's atomic instructions instead of the borrow checker's exclusivity rule.
+Chapter 8 is entirely about why that's sound and why it's the reason <code>Backend</code> can
+be shared across every task touching it at once.</p>
+
+<h2>Associated functions vs. methods</h2>
+<p>A function inside an <code>impl</code> block that doesn't take <code>self</code> is an
+<strong>associated function</strong> &mdash; called via <code>Type::function(...)</code>
+rather than <code>value.method(...)</code>. Constructors are the common case:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — Backend::new</div>
+  <pre><code>impl Backend {
+    pub fn new(addr: SocketAddr) -&gt; Self {
+        Backend {
+            addr,
+            label: addr.to_string(),
+            // Optimistic: assume up until a probe or a live error says otherwise.
+            healthy: AtomicBool::new(true),
+            active_sessions: AtomicI64::new(0),
+            selected_total: AtomicU64::new(0),
+            health_failures: AtomicU64::new(0),
+        }
+    }</code></pre>
+</div>
+<p><code>Backend::new(addr)</code> is how every backend gets created; there's no
+implicit/default construction the way a Go struct literal with omitted fields silently
+zero-values everything. <code>Self</code> is shorthand for "the type this <code>impl</code>
+block is for" &mdash; useful in generic or heavily-nested code; <code>Balancer::new</code> uses
+it in its return type:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::new</div>
+  <pre><code>impl Balancer {
+    pub fn new(
+        listen: UdpSocket,
+        backends: Arc&lt;Vec&lt;Arc&lt;Backend&gt;&gt;&gt;,
+        selector: Selector,
+        metrics: Arc&lt;Metrics&gt;,
+        idle_timeout: Duration,
+    ) -&gt; Arc&lt;Self&gt; {
+        Arc::new(Balancer {
+            listen: Arc::new(listen),
+            backends,
+            selector,
+            metrics,
+            idle_timeout,
+            sessions: Mutex::new(HashMap::new()),
+            pool_down_warned: AtomicBool::new(false),
+        })
+    }</code></pre>
+</div>
+<p>Returning <code>Arc&lt;Self&gt;</code> instead of a bare <code>Balancer</code> is a
+deliberate API choice, previewed here and explained fully in chapter 8: nearly every method on
+<code>Balancer</code> needs to be callable from a spawned task, which means the balancer
+itself needs to live behind a reference-counted pointer from the moment it's constructed.</p>
+
+<h2>Traits: compile-time interfaces</h2>
+<p>A <code>trait</code> declares behavior a type can implement, much like a Go interface
+&mdash; but where Go interfaces are satisfied structurally (any type with the right methods
+qualifies, implicitly), Rust <code>impl Trait for Type</code> is explicit, and resolution
+happens at compile time by default (static dispatch, monomorphized per concrete type) rather
+than through a runtime interface table. You'll recognize traits by name even before writing
+one: <code>Default</code> (a type-defined "zero value" constructor), and the formatting traits
+<code>Display</code> (user-facing <code>{}</code> formatting) and <code>Debug</code>
+(developer-facing <code>{:?}</code> formatting). <code>Metrics</code> derives
+<code>Default</code> so every atomic counter starts at zero without hand-writing a
+constructor:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/metrics.rs — Metrics</div>
+  <pre><code>#[derive(Default)]
+pub struct Metrics {
+    pub packets_to_server: AtomicU64,
+    pub packets_to_client: AtomicU64,
+    pub bytes_to_server: AtomicU64,
+    pub bytes_to_client: AtomicU64,
+    pub dropped_to_server: AtomicU64,
+    pub dropped_to_client: AtomicU64,
+    pub sessions_active: AtomicI64,
+    pub sessions_total: AtomicU64,
+    pub sessions_rejected: AtomicU64,
+    pub quic_initials: AtomicU64,
+}</code></pre>
+</div>
+<pre><code>let metrics = Arc::new(Metrics::default());</code></pre>
+
+<h2>#[derive(...)]: generating trait impls</h2>
+<p><code>#[derive(Trait)]</code> asks the compiler to generate a mechanical implementation
+&mdash; no hand-written boilerplate, no risk of the implementation drifting from the fields it
+should cover. This crate reaches for it constantly:</p>
+<pre><code>#[derive(Clone, Debug)]</code></pre>
+<pre><code>#[derive(Clone, Copy, Debug, PartialEq, Eq)]</code></pre>
+<pre><code>#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]</code></pre>
+<p><code>Clone</code> gives you <code>.clone()</code>; <code>Copy</code> (only valid for
+types that are safe to bitwise-duplicate) switches a type from move to copy semantics
+(chapter 3); <code>Debug</code> enables <code>{:?}</code> formatting for logging and test
+assertions; <code>PartialEq</code>/<code>Eq</code> enable <code>==</code>;
+<code>PartialOrd</code>/<code>Ord</code> (on <code>Level</code>) enable <code>&lt;</code>/<code>&gt;</code>
+comparisons &mdash; which is exactly how <code>log::enabled</code> compares a message's level
+against the configured minimum.</p>
+
+<div class="callout callout-warstory">
+  <span class="callout-label">War story: trait bounds in std APIs</span>
+  <p>An early config test called <code>.unwrap_err()</code> on a parse result whose <code>Ok</code> type was <code>ParseOutcome</code>:</p><div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — requires_backends</div>
+  <pre><code>#[test]
+fn requires_backends() {
+    let err = parse(args(&amp;[])).unwrap_err();
+    assert!(err.contains("--backends"));</code></pre>
+</div><p>and the build failed with:</p><pre><code>error[E0277]: `ParseOutcome` doesn't implement `Debug`
+required by a bound in `Result::&lt;T, E&gt;::unwrap_err`</code></pre><p><strong>Diagnosis:</strong> <code>Result::unwrap_err</code>'s signature bounds <code>T: Debug</code> &mdash; if the value turns out to actually be <code>Ok</code>, the panic message needs to print it, which requires a <code>Debug</code> impl on the <code>Ok</code> type. <code>ParseOutcome</code> didn't have one yet. <strong>Fix:</strong> one derive:</p><div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — ParseOutcome</div>
+  <pre><code>#[derive(Debug)]
+pub enum ParseOutcome {
+    Run(Config),
+    Help,
+}</code></pre>
+</div><p><strong>Lesson:</strong> standard library APIs constrain their generic parameters with trait bounds, and a missing bound is a compile error naming the exact trait you're missing and the exact API that requires it &mdash; not a vague runtime failure. Once you learn to read <code>E0277</code>, &ldquo;add the derive it's asking for&rdquo; becomes a reflex.</p>
+</div>
+
+<h2>Generics and bounds</h2>
+<p><code>config::parse</code> doesn't take a concrete <code>Vec&lt;String&gt;</code>; it's
+generic over anything iterable:</p>
+<pre><code>pub fn parse&lt;I: IntoIterator&lt;Item = String&gt;&gt;(args: I) -&gt; Result&lt;ParseOutcome, String&gt; {</code></pre>
+<p><code>I: IntoIterator&lt;Item = String&gt;</code> is a <strong>trait bound</strong>: "any
+type <code>I</code>, as long as it can produce an iterator of <code>String</code>s." That
+accepts <code>Vec&lt;String&gt;</code> (used by every test in this file), <code>env::args().skip(1)</code>
+(used by <code>main</code>), or any other iterable &mdash; without <code>parse</code> ever
+committing to one concrete collection type. The compiler generates a separate, fully
+specialized version of <code>parse</code> for each concrete type it's actually called with
+(<strong>monomorphization</strong>), so this generality costs nothing at runtime &mdash; no
+boxing, no dynamic dispatch, unlike a Go function taking an <code>interface</code> parameter,
+which does incur an interface-value indirection.</p>
+
+<p>One more preview, expanded fully in chapter 8: <code>Send</code> and <code>Sync</code> are
+traits too, but you never write <code>impl Send for Backend</code> &mdash; the compiler
+auto-derives them based on whether every field is itself <code>Send</code>/<code>Sync</code>.
+That's what makes a type like <code>Backend</code> safe to share across tasks, and it's
+checked the same mechanical way every other trait bound is: at compile time, exhaustively.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>Add a <code>#[derive(Debug)]</code> line above the <code>Backend</code> struct in <code>lb/src/backend.rs</code>, then in a scratch <code>#[test]</code> (or in <code>strategy.rs</code>'s existing tests, which already construct backends), try printing one with <code>println!("{:?}", backend)</code>. Then remove the derive again and re-run &mdash; read the <code>E0277</code> the compiler gives you and notice it's the same shape as war story #3.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="05-errors.html"><span class="label">Previous</span><span class="chapter-nav-title">Result and the ? operator</span></a><a class="next" href="07-collections-iterators.html"><span class="label">Next</span><span class="chapter-nav-title">Vec, HashMap, iterators</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fearless concurrency — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="current" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 08</span>
+<h1>Fearless concurrency</h1>
+
+<p class="lede">This is the chapter this whole crate exists to demonstrate. The claim &mdash;
+that data races become compile errors instead of code-review catches &mdash; sounds like
+marketing until you see it enforced on a type you actually understand. <code>Backend</code>
+is that type.</p>
+
+<h2>Send and Sync are derived, not written</h2>
+<p><code>Send</code> (safe to move to another thread) and <code>Sync</code> (safe to share by
+reference across threads) are traits, but you never write <code>impl Send for Backend</code>.
+The compiler derives them automatically: a type is <code>Send</code>/<code>Sync</code> if and
+only if every one of its fields is. Recall <code>Backend</code>'s fields from chapter 6:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — Backend</div>
+  <pre><code>pub struct Backend {
+    addr: SocketAddr,
+    /// Label used in logs and metrics; the address string is stable and unique.
+    label: String,
+    healthy: AtomicBool,
+    active_sessions: AtomicI64,
+    selected_total: AtomicU64,
+    /// Consecutive active-probe failures; reset to 0 on any success.
+    health_failures: AtomicU64,
+}</code></pre>
+</div>
+<p>Every field is an atomic type, and every atomic type is <code>Sync</code> by construction
+(that's the entire point of atomics: they define what happens when multiple threads touch them
+concurrently). Because every field qualifies, <code>Backend</code> is <code>Sync</code>
+automatically &mdash; which is what makes <code>&amp;Backend</code> (and therefore
+<code>Arc&lt;Backend&gt;</code>) safe to hand to the receive loop, every session's return task,
+and the health checker simultaneously. Swap one field for a plain, non-atomic <code>i64</code>
+and <code>Backend</code> silently stops being <code>Sync</code> &mdash; and every place that
+shares it across an <code>await</code> or a spawned task stops compiling, with the compiler
+pointing at exactly the field that broke it. That's the mechanism behind the "compile error,
+not a code review catch" claim: it isn't a lint, it's a consequence of the type system that
+falls out for free once every field is atomic.</p>
+
+<h2>Arc&lt;T&gt;: shared ownership across tasks</h2>
+<p><code>Arc&lt;T&gt;</code> (atomically reference-counted) is a pointer to heap data with a
+shared-ownership refcount, safe to clone across threads &mdash; clone bumps the count (cheap,
+lock-free), drop decrements it, and the data is freed when the count hits zero. It's the
+multi-owner escape hatch from chapter 3's "exactly one owner" rule, used precisely where
+multiple concurrent tasks legitimately need the same data to outlive any one of them. This
+crate reaches for it everywhere ownership needs to be shared: individual backends
+(<code>Arc&lt;Backend&gt;</code>), the whole pool (<code>Arc&lt;Vec&lt;Arc&lt;Backend&gt;&gt;&gt;</code>),
+each session (<code>Arc&lt;Session&gt;</code>), the metrics block
+(<code>Arc&lt;Metrics&gt;</code>), and the balancer itself:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/main.rs — serve</div>
+  <pre><code>let backends: Arc&lt;Vec&lt;Arc&lt;Backend&gt;&gt;&gt; = Arc::new(
+    cfg.backends
+        .iter()
+        .map(|addr| Arc::new(Backend::new(*addr)))
+        .collect(),
+);</code></pre>
+</div>
+<p>and every method that needs to hand a copy of itself into a spawned task takes
+<code>self: Arc&lt;Self&gt;</code> instead of <code>&amp;self</code>:</p>
+<pre><code>pub async fn run(self: Arc&lt;Self&gt;, shutdown: Arc&lt;Notify&gt;) {
+async fn get_or_create(self: &amp;Arc&lt;Self&gt;, client: SocketAddr) -&gt; Option&lt;Arc&lt;Session&gt;&gt; {
+async fn return_loop(self: Arc&lt;Self&gt;, session: Arc&lt;Session&gt;) {
+async fn sweep_loop(self: Arc&lt;Self&gt;) {</code></pre>
+<p>That's <code>Balancer::run</code>, <code>get_or_create</code>, <code>return_loop</code>, and
+<code>sweep_loop</code> &mdash; four different methods, all taking the balancer itself as an
+<code>Arc</code> because all four need to hand a live, still-owned handle to a task that will
+outlive the current call. <code>tokio::spawn</code> requires its future to be
+<code>'static</code> (own everything it touches, borrow nothing from the caller's stack), and
+<code>Arc::clone</code> is exactly how you satisfy that without literally copying the
+balancer's state.</p>
+
+<h2>Mutex&lt;T&gt; wraps the data, not a code section</h2>
+<p>Go's <code>sync.Mutex</code> guards a critical section of <em>code</em> &mdash; nothing
+stops you from touching the protected data outside the lock, except discipline.
+<code>std::sync::Mutex&lt;T&gt;</code> wraps the <em>data</em> itself: there is no way to
+obtain a <code>&amp;HashMap</code> from inside the session table without going through
+<code>.lock()</code> first, and the returned guard borrows the mutex for exactly as long as
+you hold it. The type system, not convention, is what prevents an unguarded access.</p>
+<p>That guarantee comes with a new failure mode to manage by hand: holding a lock across an
+<code>.await</code> point blocks every other task waiting on that mutex for as long as the
+await takes &mdash; potentially a full network round trip. <code>get_or_create</code>'s own
+comment states the rule it follows:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::get_or_create</div>
+  <pre><code>// Choose a backend and open the upstream socket *before* taking the lock
+// again, so the await points don't hold the mutex across .await.</code></pre>
+</div>
+<p>The pattern in practice: select a backend and open the upstream socket (both of which may
+<code>.await</code>) <em>before</em> taking the lock; then take the lock only for the
+plain, synchronous <code>HashMap</code> read or insert, and let the guard drop immediately.
+The <code>Arc&lt;Session&gt;</code> gets cloned out from behind the lock, and every subsequent
+line of code operates on that owned clone &mdash; never on a reference still borrowed from the
+guard.</p>
+
+<h2>Atomics and memory ordering, briefly</h2>
+<p>Atomic types (<code>AtomicBool</code>, <code>AtomicI64</code>, <code>AtomicU64</code>, ...)
+give lock-free, thread-safe reads and writes of a single value via CPU-level atomic
+instructions. The hot path records every packet with one <code>fetch_add</code>, no lock
+anywhere in sight:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/metrics.rs — Metrics::add_to_server</div>
+  <pre><code>pub fn add_to_server(&amp;self, bytes: usize) {
+    self.packets_to_server.fetch_add(1, Ordering::Relaxed);
+    self.bytes_to_server
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+}</code></pre>
+</div>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/backend.rs — inc_sessions / dec_sessions</div>
+  <pre><code>pub fn inc_sessions(&amp;self) {
+    self.active_sessions.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn dec_sessions(&amp;self) {
+    self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+}</code></pre>
+</div>
+<p>Every one of those uses <code>Ordering::Relaxed</code> &mdash; and almost everything in
+this crate does. Keep the mental model to two paragraphs: <strong>Relaxed</strong> means "this
+operation is atomic (no torn reads, no lost updates) but carries no promise about the ordering
+of any <em>other</em> memory access around it" &mdash; correct for independent counters where
+you only care that increments aren't lost, not about what happened concurrently elsewhere.
+Stronger orderings (<code>Acquire</code>, <code>Release</code>, <code>AcqRel</code>,
+<code>SeqCst</code>) additionally synchronize memory visibility between threads around that
+specific operation &mdash; use them when one atomic's value is standing in for "is it safe to
+look at other data now."</p>
+<p>Exactly one operation in this crate uses <code>AcqRel</code> instead of
+<code>Relaxed</code>, and it's the one place that decision actually matters, covered next.</p>
+
+<h2>The flagship comparison: exactly-once teardown</h2>
+<p>Every session needs to be torn down <em>exactly once</em>, no matter which of several
+concurrent paths discovers it should close first &mdash; the receive loop can decide a client
+is being rejected, the return task can see the upstream socket error, and the idle sweeper can
+independently decide the session is stale, all around the same moment. Go and Rust solve
+"who wins the race to clean this up" with completely different primitives.</p>
+
+<p>The Go proxy answers it with <code>sync.Once</code> plus a channel close:</p>
+<pre><code>closeOnce sync.Once
+done      chan struct{}</code></pre>
+<div class="snippet">
+  <div class="snippet-caption">internal/proxy/proxy.go — (*session).close</div>
+  <pre><code>func (s *session) close() error {
+	var closeErr error
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if s.onClose != nil {
+			s.onClose()
+		}
+		if err := s.upstreamConn.Close(); err != nil &amp;&amp; !errors.Is(err, net.ErrClosed) {
+			closeErr = err
+		}
+	})
+	return closeErr
+}</code></pre>
+</div>
+<p><code>sync.Once.Do</code> guarantees its function argument runs exactly once no matter how
+many goroutines call <code>close()</code> concurrently &mdash; the runtime handles the
+mutual exclusion internally. <code>close(s.done)</code> is the actual signal: closing an
+already-closed channel panics, so <code>sync.Once</code> is also what protects against a
+double-close panic here, not just against redundant work.</p>
+
+<p>This crate answers the identical problem with one boolean and one compare-and-swap, no
+mutex and no runtime-managed primitive at all:</p>
+<pre><code>closed: AtomicBool,</code></pre>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/balancer.rs — Balancer::finish</div>
+  <pre><code>fn finish(&amp;self, session: &amp;Arc&lt;Session&gt;) {
+    if session.closed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    session.shutdown.notify_one();
+    session.backend.dec_sessions();
+    self.metrics.session_closed();
+}</code></pre>
+</div>
+<div class="compare">
+  <div><h4>Go — sync.Once + channel close</h4><p>State: <code>closeOnce sync.Once</code> field (module-level object, opaque internal state) plus a <code>closed chan struct{}</code> as the actual signal.</p><p>Winning caller runs the closure inside <code>Do</code>; losers block until the closure finishes, then return immediately &mdash; <code>sync.Once</code> makes that blocking-until-done guarantee for you.</p></div>
+  <div><h4>Rust — AtomicBool CAS</h4><p>State: one <code>AtomicBool</code> field, no separate runtime object.</p><p><code>swap(true, AcqRel)</code> atomically sets <code>closed</code> to <code>true</code> <em>and</em> returns what it was a moment before. If that was already <code>true</code>, this caller lost the race and returns immediately &mdash; no blocking, no waiting for the winner to finish.</p></div>
+</div>
+<p>This is why <code>finish</code> is the one place in the crate that reaches for
+<code>Ordering::AcqRel</code> instead of <code>Relaxed</code>: the swap on <code>closed</code>
+isn't just a counter, it's a gate deciding whether this call proceeds to touch
+<code>session.backend</code> and <code>self.metrics</code> at all. <code>AcqRel</code>
+(acquire-release) ensures that whichever caller wins the swap has a synchronized view of
+everything written before any prior attempt, and that its own writes (decrementing the
+backend's session count, closing the metrics gauge) become visible to anyone who checks
+<code>closed</code> afterward. <code>Notify::notify_one</code> then wakes the return task
+&mdash; covered fully in chapter 9 &mdash; which is this crate's equivalent of the channel
+close signaling the same shutdown.</p>
+<p>Same guarantee, both languages: whoever calls the teardown function first does the work,
+everyone else is a safe, cheap no-op. Go leans on a runtime-provided synchronization object
+built for exactly this pattern; Rust expresses the identical guarantee as one atomic
+read-modify-write instruction with no separate object needed at all &mdash; ownership plus one
+boolean is the whole mechanism.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/balancer.rs</code>, change <code>finish</code>'s <code>session.closed.swap(true, Ordering::AcqRel)</code> to use <code>Ordering::Relaxed</code> instead, and run <code>cargo test</code> in <code>lb/</code>. The suite will very likely still pass &mdash; this is the sharp edge of memory-ordering bugs: they're usually invisible until timing conditions on a different platform or under load expose the missing synchronization. Read the comment above <code>finish</code> again, then revert. Being able to explain <em>why</em> <code>AcqRel</code> is the right choice here, even though a weaker ordering often &ldquo;works,&rdquo; is the actual exercise.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="07-collections-iterators.html"><span class="label">Previous</span><span class="chapter-nav-title">Vec, HashMap, iterators</span></a><a class="next" href="09-async.html"><span class="label">Next</span><span class="chapter-nav-title">Async with tokio</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>

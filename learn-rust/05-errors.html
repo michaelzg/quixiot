@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Result and the ? operator — Learn Rust via quixiot-lb</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar">
+  <a class="site-title" href="index.html">Learn Rust<small>via quixiot-lb</small></a>
+  <ol class="chapter-list">
+<li><a class="" href="index.html"><span class="num">00</span><span>Overview &amp; map</span></a></li>
+<li><a class="" href="01-toolchain.html"><span class="num">01</span><span>Cargo &amp; the crate</span></a></li>
+<li><a class="" href="02-fundamentals.html"><span class="num">02</span><span>Bindings &amp; types</span></a></li>
+<li><a class="" href="03-ownership.html"><span class="num">03</span><span>Ownership &amp; borrowing</span></a></li>
+<li><a class="" href="04-enums-matching.html"><span class="num">04</span><span>Enums, match, Option</span></a></li>
+<li><a class="current" href="05-errors.html"><span class="num">05</span><span>Result and ?</span></a></li>
+<li><a class="" href="06-structs-traits.html"><span class="num">06</span><span>Structs, impl, traits</span></a></li>
+<li><a class="" href="07-collections-iterators.html"><span class="num">07</span><span>Collections &amp; iterators</span></a></li>
+<li><a class="" href="08-concurrency.html"><span class="num">08</span><span>Fearless concurrency</span></a></li>
+<li><a class="" href="09-async.html"><span class="num">09</span><span>Async with tokio</span></a></li>
+<li><a class="" href="10-parsing-macros.html"><span class="num">10</span><span>Parsing &amp; macros</span></a></li>
+<li><a class="" href="11-testing.html"><span class="num">11</span><span>Testing, clippy, fmt</span></a></li>
+<li><a class="" href="12-rust-vs-go.html"><span class="num">12</span><span>Rust vs Go retrospective</span></a></li>
+  </ol>
+  <div class="sidebar-foot">Every example on this site is real code from <code>lb/</code> in this repository. Run <code>make lb-test</code> to see it pass.</div>
+</nav>
+<main class="content">
+<article>
+<span class="kicker">Chapter 05</span>
+<h1>Result and the ? operator</h1>
+
+<p class="lede">You already think in errors-as-values from Go &mdash; this chapter is mostly
+about the specific vocabulary Rust uses for the same idea, plus the <code>?</code> operator,
+which is the one piece with no direct Go equivalent.</p>
+
+<h2>Result&lt;T, E&gt;</h2>
+<p><code>Result&lt;T, E&gt;</code> is <code>Option</code>'s sibling: <code>Ok(T)</code> or
+<code>Err(E)</code>, a real type, checked exhaustively like any other enum. Where Go returns
+<code>(value, error)</code> as two separate values and trusts you to check <code>err != nil</code>
+before touching <code>value</code>, Rust's version is one value that can only be in one state
+at a time &mdash; there's no way to hold a meaningless zero-valued <code>T</code> next to a
+non-nil error, because there's no <code>T</code> at all in the <code>Err</code> case.</p>
+
+<h2>?: tracing one real chain</h2>
+<p>The <code>?</code> operator is early-return propagation: on an <code>Err</code>, it returns
+that <code>Err</code> from the enclosing function immediately; on <code>Ok</code>, it unwraps
+to the inner value and execution continues. It's the Rust equivalent of Go's
+<code>if err != nil { return err }</code>, except it's one character and the compiler
+enforces that you can't accidentally use the value without having handled the error path.</p>
+<p>Follow one real path end to end. It starts in <code>main</code>:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/main.rs — main</div>
+  <pre><code>let cfg = match config::parse(std::env::args().skip(1)) {
+    Ok(ParseOutcome::Run(cfg)) =&gt; cfg,
+    Ok(ParseOutcome::Help) =&gt; {
+        print!("{}", config::usage());
+        return ExitCode::SUCCESS;
+    }
+    Err(msg) =&gt; {
+        eprintln!("quixiot-lb: {msg}");
+        return ExitCode::FAILURE;
+    }
+};</code></pre>
+</div>
+<p><code>config::parse</code> returns <code>Result&lt;ParseOutcome, String&gt;</code>. Inside
+it, flags like <code>--listen</code> call <code>parse_addr(&amp;value()?)?</code> &mdash; two
+<code>?</code>s in one expression: the first propagates a missing-value error from the
+<code>value()</code> closure (chapter 2), the second propagates a resolution failure from
+<code>parse_addr</code> itself:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — parse_addr</div>
+  <pre><code>fn parse_addr(s: &amp;str) -&gt; Result&lt;SocketAddr, String&gt; {
+    s.to_socket_addrs()
+        .map_err(|e| format!("bad address {s:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("address {s:?} resolved to nothing"))
+}</code></pre>
+</div>
+<p>If either fails, the <code>String</code> error bubbles all the way up through
+<code>config::parse</code>'s return, without any of the intermediate call sites writing a
+single <code>if err != nil</code> check. It surfaces in <code>main</code>'s <code>match</code>
+above as <code>Err(msg)</code>, gets printed with <code>eprintln!</code>, and <code>main</code>
+returns <code>ExitCode::FAILURE</code> &mdash; a typed alternative to <code>os.Exit(1)</code>
+that still lets destructors run on the way out, since it's a normal return rather than a
+process-terminating call.</p>
+
+<div class="callout callout-go">
+  <span class="callout-label">Go contrast</span>
+  <p>The same shape, in Go, is <code>cmd/server/main.go</code>'s split between <code>main</code> and <code>run</code>:</p><div class="snippet">
+  <div class="snippet-caption">cmd/server/main.go</div>
+  <pre><code>func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}</code></pre>
+</div><p><code>run</code> returns a plain <code>error</code> that every fallible step inside it propagates with <code>if err != nil { return err }</code> or a wrapped <code>fmt.Errorf("...: %w", err)</code>; <code>main</code> is the one place that decides what to do with a top-level failure (print it, exit 1). The Rust version is structurally the same instinct &mdash; a thin <code>main</code>, a fallible core, explicit propagation &mdash; with <code>?</code> replacing the repeated <code>if err != nil</code> boilerplate at every call site.</p>
+</div>
+
+<h2>Error types: pragmatism over hierarchy</h2>
+<p>This crate uses a plain <code>String</code> for CLI/config errors &mdash; pragmatic for a
+small tool where every error is ultimately just a message printed to stderr, and not worth a
+custom error enum. Where a function is doing real I/O, it uses <code>std::io::Error</code>
+instead, because that's the type the standard library itself produces and callers may want to
+inspect its <code>ErrorKind</code> (chapter 9 uses exactly that to distinguish
+"connection refused" from other failures):</p>
+<pre><code>async fn dial_upstream(&amp;self, backend: &amp;Backend) -&gt; std::io::Result&lt;UdpSocket&gt; {</code></pre>
+<pre><code>pub fn bind_udp(addr: SocketAddr, buf_bytes: usize) -&gt; std::io::Result&lt;(UdpSocket, usize)&gt; {</code></pre>
+<p>As a codebase grows past "every error is a string," the common next step is
+<code>Box&lt;dyn std::error::Error&gt;</code> (any error type, boxed, at some cost to
+matching on specific variants) or a hand-written enum with a crate like <code>thiserror</code>
+generating the boilerplate (each error case as its own enum variant, structured and
+matchable). Neither is warranted here &mdash; worth knowing the scaling path exists without
+reaching for it prematurely.</p>
+
+<h2>unwrap and expect: policy, not prohibition</h2>
+<p><code>.unwrap()</code> and <code>.expect("message")</code> convert a <code>Result</code>/<code>Option</code>
+into its inner value or <strong>panic</strong> &mdash; an unrecoverable, unwinding failure,
+not a <code>Result</code> the caller can handle. They're fine in two situations: tests (a
+failing precondition should abort that test loudly), and cases the type system can't see are
+infallible but you can prove by inspection. The crate's default listen address is a literal
+you control:</p>
+<div class="snippet">
+  <div class="snippet-caption">lb/src/config.rs — Config::default_listen</div>
+  <pre><code>impl Config {
+    fn default_listen() -&gt; SocketAddr {
+        "127.0.0.1:4450".parse().unwrap()
+    }</code></pre>
+</div>
+<p><code>"127.0.0.1:4450"</code> is a hardcoded, valid address string; parsing it can never
+actually fail, so <code>.unwrap()</code> just asserts that fact rather than threading a
+<code>Result</code> through a function that has no real failure mode. Same reasoning in
+<code>Selector::select</code>'s least-connections arm:</p>
+<pre><code>.expect("healthy is non-empty"),</code></pre>
+<p>the caller already checked <code>healthy</code> is non-empty two lines earlier, so
+<code>.expect(...)</code> documents <em>why</em> this can't fail rather than silently hoping.
+Outside of proven-infallible cases and tests, reaching for <code>unwrap</code> instead of
+propagating with <code>?</code> is a smell &mdash; it turns a recoverable error into a crash.</p>
+
+<div class="callout callout-gotcha">
+  <span class="callout-label">Mutex poisoning</span>
+  <p>The session table is guarded by a <code>Mutex</code>, and every lock site in this crate calls <code>.lock().unwrap()</code>:</p><pre><code>if let Some(session) = self.sessions.lock().unwrap().get(&amp;client).cloned() {</code></pre><p><code>Mutex::lock()</code> returns a <code>Result</code>, not the guard directly, because if a thread panics <em>while holding the lock</em>, the mutex becomes &ldquo;poisoned&rdquo; and every subsequent <code>.lock()</code> returns <code>Err</code> rather than silently handing out a guard over data that might be in a half-mutated, inconsistent state. <code>.unwrap()</code> here is a deliberate policy: this crate treats poisoning as unrecoverable (a panic while the map is locked means a bug, and the process should go down loudly rather than limp on with possibly-corrupt session state) &mdash; not a case where <code>?</code> should propagate a soft error.</p>
+</div>
+
+<h2>Panics vs. Results</h2>
+<p>Use a <code>Result</code> when the caller has a reasonable way to recover (a bad CLI flag,
+a socket that failed to open once). Panic when continuing would mean operating on data you've
+already proven is broken (a poisoned mutex above), or when something is a programmer error
+rather than a runtime condition (an index out of bounds, an assertion in a test). The line
+matches your Go instincts about when to return an error versus when to legitimately let a
+goroutine crash &mdash; Rust just gives the "recoverable failure" path a real type instead of
+an interface value that's sometimes nil.</p>
+
+<div class="callout callout-tryit">
+  <span class="callout-label">Try it</span>
+  <p>In <code>lb/src/config.rs</code>, change <code>Config::default_listen</code>'s literal from <code>"127.0.0.1:4450"</code> to something unparseable, like <code>"not-an-address"</code>, and run <code>cargo test</code>. Watch <code>.unwrap()</code> stop being infallible and turn into a real panic &mdash; this is exactly the risk the crate is accepting every time it reaches for <code>unwrap</code> instead of <code>?</code>. Revert the change afterward.</p>
+</div>
+
+</article>
+<footer class="chapter-nav"><a class="prev" href="04-enums-matching.html"><span class="label">Previous</span><span class="chapter-nav-title">Enums, match, Option</span></a><a class="next" href="06-structs-traits.html"><span class="label">Next</span><span class="chapter-nav-title">Structs, impl, traits, derive</span></a></footer>
+</main>
+</div>
+<script src="assets/highlight.js"></script>
+</body>
+</html>
