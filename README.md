@@ -67,6 +67,27 @@ PROFILE=cellular-3g make run-proxy
 COUNT=10 ROLE=mixed make run-fleet
 ```
 
+### Rust load balancer
+
+[`lb/`](lb/README.md) is an educational L4 (UDP) load balancer written in Rust
+that fronts several QUIC servers, keeps each client pinned to one backend
+(required for QUIC), balances new sessions across them, and health-checks the
+pool. It's a companion piece to the Go impairment proxy — same forwarding model,
+different language — written to show off Rust's concurrency and safety story
+(see the [lb README](lb/README.md) for the annotated tour).
+
+```sh
+make lb-demo          # 3 servers behind the LB: distribution, failover, and recovery
+```
+
+Or wire it up by hand — start a few servers, then point the LB and a client at them:
+
+```sh
+make run-server SERVER_ADDR=127.0.0.1:4444   # repeat on :4445, :4446 in other shells
+make run-lb LB_BACKENDS=127.0.0.1:4444,127.0.0.1:4445,127.0.0.1:4446 LB_STRATEGY=least-conn
+SERVER_URL=https://127.0.0.1:4450 ROLE=poller make run-client
+```
+
 ## Metrics
 
 Every binary exposes Prometheus metrics on a plain HTTP endpoint so a single Prometheus instance can scrape the whole stack:
@@ -77,6 +98,7 @@ Every binary exposes Prometheus metrics on a plain HTTP endpoint so a single Pro
 | proxy | `127.0.0.1:9104` | `--metrics-addr` |
 | client (standalone) | none unless set | `--metrics-addr` |
 | fleet child `i` | `127.0.0.1:9200+i` | `--metrics-port-base` |
+| load balancer (`lb/`) | `127.0.0.1:9106` | `--metrics-addr` |
 
 The server *also* serves the same registry over HTTP/3 at `https://127.0.0.1:4444/metrics` for in-band debugging. The plain endpoint exists because Prometheus does not speak HTTP/3.
 
@@ -219,6 +241,7 @@ The verification script checks:
 ```text
 cmd/{server,client,proxy,fleet}    binaries
 internal/                          implementation packages
+lb/                                Rust L4 load balancer (see lb/README.md)
 configs/                           proxy impairment profiles
 scripts/                           demo, verify, and helper tooling
 deploy/                            docker-compose, prometheus.yml, Grafana provisioning + dashboards
